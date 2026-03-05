@@ -1,20 +1,26 @@
+
 import {
   ActionRowBuilder,
+  ActivityType,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
   Client,
   EmbedBuilder,
+  GatewayIntentBits,
   IntentsBitField,
+  ModalBuilder,
   PermissionFlagsBits,
-  StringSelectMenuBuilder,
-  TextChannel,
   SlashCommandBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type ChatInputCommandInteraction,
+  type GuildMember,
   type Message,
-  type StringSelectMenuInteraction
+  type TextChannel
 } from "discord.js";
-import crypto from "node:crypto";
 import Redis from "ioredis";
+import crypto from "node:crypto";
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
@@ -24,96 +30,60 @@ if (!token) {
 
 const apiBaseUrl = process.env.API_BASE_URL ?? "http://api:3001";
 const serverManagerBaseUrl = process.env.SERVER_MANAGER_BASE_URL ?? "http://server-manager:3003";
-const liveMatchesChannelId = process.env.DISCORD_CHANNEL_LIVE_MATCHES ?? "";
-const queueChannelId = process.env.DISCORD_CHANNEL_QUEUE ?? "";
-const overwatchChannelId = process.env.DISCORD_CHANNEL_OVERWATCH ?? "";
-const serverStatusChannelId = process.env.DISCORD_CHANNEL_SERVER_STATUS ?? "";
-const mapVoteChannelId = process.env.DISCORD_CHANNEL_MAP_VOTE ?? "";
 const guildId = process.env.DISCORD_GUILD_ID ?? "";
-const modJwt = process.env.DISCORD_MOD_JWT ?? "";
 const botApiToken = process.env.DISCORD_BOT_API_TOKEN ?? "";
+const defaultRegion = process.env.DISCORD_DEFAULT_REGION ?? "eu";
 const enableTestMode = (process.env.DISCORD_ENABLE_TEST_MODE ?? "false").toLowerCase() === "true";
 const moderatorRoleId = process.env.DISCORD_MODERATOR_ROLE_ID ?? "";
-const playerLinksRaw = process.env.DISCORD_PLAYER_LINKS_JSON ?? "{}";
-const playerDiscordMap: Record<string, string> = (() => {
-  try {
-    const parsed = JSON.parse(playerLinksRaw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-})();
-const COMMUNITY_MAPS = ["de_mirage", "de_inferno", "de_dust2", "de_overpass", "de_ancient", "de_nuke", "de_vertigo"];
-const REPORT_REASONS = ["cheating", "griefing", "toxic", "afk"] as const;
+const adminRoleId = process.env.DISCORD_ADMIN_ROLE_ID ?? "";
 
-const SKINS_CATALOG: Record<string, Array<{ id: string; name: string }>> = {
-  ak47: [
-    { id: "redline", name: "Redline" },
-    { id: "asiimov", name: "Asiimov" },
-    { id: "vulcan", name: "Vulcan" },
-    { id: "fire_serpent", name: "Fire Serpent" }
-  ],
-  "m4a1-s": [
-    { id: "printstream", name: "Printstream" },
-    { id: "nightmare", name: "Nightmare" },
-    { id: "golden_coil", name: "Golden Coil" },
-    { id: "mecha_industries", name: "Mecha Industries" }
-  ],
-  awp: [
-    { id: "dragon_lore", name: "Dragon Lore" },
-    { id: "asiimov", name: "Asiimov" },
-    { id: "medusa", name: "Medusa" },
-    { id: "wildfire", name: "Wildfire" }
-  ],
-  knife: [
-    { id: "karambit_fade", name: "Karambit | Fade" },
-    { id: "m9_doppler", name: "M9 Bayonet | Doppler" },
-    { id: "butterfly_slaughter", name: "Butterfly | Slaughter" }
-  ],
-  gloves: [
-    { id: "sport_pandora", name: "Sport Gloves | Pandora's Box" },
-    { id: "specialist_fade", name: "Specialist Gloves | Fade" },
-    { id: "driver_king_snake", name: "Driver Gloves | King Snake" }
-  ]
+const channelIds = {
+  verify: process.env.DISCORD_CHANNEL_VERIFY ?? "",
+  queue: process.env.DISCORD_CHANNEL_QUEUE ?? "",
+  mapVote: process.env.DISCORD_CHANNEL_MAP_VOTE ?? "",
+  serverStatus: process.env.DISCORD_CHANNEL_SERVER_STATUS ?? "",
+  updates: process.env.DISCORD_UPDATE_LOG_CHANNEL_ID ?? process.env.DISCORD_CHANNEL_UPDATES ?? "",
+  banLog: process.env.DISCORD_CHANNEL_BAN_LOG ?? "",
+  reports: process.env.DISCORD_CHANNEL_REPORTS ?? "",
+  cheaterAlerts: process.env.DISCORD_CHANNEL_CHEATER_ALERTS ?? process.env.DISCORD_CHANNEL_OVERWATCH ?? "",
+  matchResults: process.env.DISCORD_CHANNEL_MATCH_RESULTS ?? "",
+  liveMatches: process.env.DISCORD_CHANNEL_LIVE_MATCHES ?? "",
+  modLog: process.env.DISCORD_CHANNEL_MOD_LOG ?? ""
 };
 
+const roleIds = {
+  unverified: process.env.DISCORD_ROLE_UNVERIFIED_ID ?? "",
+  verified: process.env.DISCORD_ROLE_VERIFIED_ID ?? "",
+  steamVerified: process.env.DISCORD_ROLE_STEAM_VERIFIED_ID ?? ""
+};
+
+type PanelKey = "verify" | "queue" | "mapVote" | "serverStatus";
+const managedPanelChannels: Array<keyof typeof channelIds> = ["verify", "queue", "mapVote", "serverStatus"];
+
+const panelMessageIds = new Map<PanelKey, string>();
+const captchaState = new Map<string, { nonce: string; answer: string; expiresAt: number }>();
+
 const client = new Client({
-  intents: [IntentsBitField.Flags.Guilds, IntentsBitField.Flags.GuildMessages, IntentsBitField.Flags.MessageContent]
+  intents: [
+    IntentsBitField.Flags.Guilds,
+    IntentsBitField.Flags.GuildMembers,
+    IntentsBitField.Flags.GuildMessages,
+    IntentsBitField.Flags.MessageContent,
+    IntentsBitField.Flags.GuildVoiceStates,
+    GatewayIntentBits.GuildPresences
+  ]
 });
 
 const sub = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
-const liveMessageIndex = new Map<string, string>();
-const matchChannels = new Map<
-  string,
-  {
-    channelId: string;
-    playerIds: string[];
-  }
->();
-let dailyMapVoteState:
-  | {
-      date: string;
-      channelId: string;
-      votes: Record<string, number>;
-      votedUsers: Set<string>;
-      endTimer: NodeJS.Timeout;
-    }
-  | null = null;
-const matchVotes = new Map<
-  string,
-  {
-    matchId: string;
-    channelId: string;
-    voteMessageId: string;
-    teamA: any[];
-    teamB: any[];
-    maps: string[];
-    votes: Record<string, number>;
-    votedUsers: Set<string>;
-    simulateEnd: boolean;
-    timer: NodeJS.Timeout;
-  }
->();
+
+type PresenceStats = {
+  liveMatches: number;
+  serversOnline: number;
+  playersQueue: number;
+};
+
+let presenceIndex = 0;
+let presenceCache: { stats: PresenceStats; fetchedAt: number } | null = null;
 
 async function api(path: string, init?: RequestInit): Promise<any> {
   const response = await fetch(`${apiBaseUrl}${path}`, {
@@ -147,923 +117,898 @@ async function serverApi(path: string, init?: RequestInit): Promise<any> {
   return response.json();
 }
 
-async function getChannel(channelId: string): Promise<TextChannel | null> {
+async function botApi(path: string, init?: RequestInit): Promise<any> {
+  return api(path, {
+    ...init,
+    headers: {
+      "x-bot-token": botApiToken,
+      ...(init?.headers ?? {})
+    }
+  });
+}
+
+async function userApi(path: string, discordId: string, init?: RequestInit): Promise<any> {
+  return api(path, {
+    ...init,
+    headers: {
+      "x-bot-token": botApiToken,
+      "x-discord-user-id": discordId,
+      ...(init?.headers ?? {})
+    }
+  });
+}
+
+function isModerator(member: GuildMember | null): boolean {
+  if (!member) return false;
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return [moderatorRoleId, adminRoleId].filter(Boolean).some((id) => member.roles.cache.has(id));
+}
+
+async function getTextChannel(channelId: string): Promise<TextChannel | null> {
   if (!channelId) return null;
   const channel = await client.channels.fetch(channelId);
-  if (!channel || !channel.isTextBased()) return null;
+  if (!channel || channel.type !== ChannelType.GuildText) return null;
   return channel as TextChannel;
 }
 
-async function postMatchStarted(event: any): Promise<void> {
-  const channel = await getChannel(liveMatchesChannelId);
-  if (!channel) return;
-
-  const matchId = String(event.matchId ?? event.match_id ?? "unknown");
-  const match = await api(`/matches/${matchId}`);
-  const players = (match.players ?? [])
-    .map((p: any) => p.display_name ?? p.id)
-    .join(", ");
-  const spectateCommand = event.spectate ?? match.connect_string ?? "n/a";
-  const embed = new EmbedBuilder()
-    .setTitle("LIVE MATCH")
-    .addFields(
-      { name: "Match", value: matchId, inline: true },
-      { name: "Map", value: String(match.map ?? event.map ?? "unknown"), inline: true },
-      { name: "Players", value: players || "unknown" },
-      { name: "Spectate", value: `\`${spectateCommand}\`` }
-    );
-  const row = linkRow("Open Match", `${process.env.BASE_URL ?? "https://play.maro.run"}/match/${matchId}`);
-  const msg = await channel.send({ embeds: [embed], components: [row] });
-
-  liveMessageIndex.set(matchId, msg.id);
+async function safeDeleteMessage(message: Message): Promise<void> {
+  try {
+    if (message.deletable) await message.delete();
+  } catch {
+    // no-op
+  }
 }
 
-async function postMatchFinished(event: any): Promise<void> {
-  const channel = await getChannel(liveMatchesChannelId);
-  if (!channel) return;
-  const matchId = String(event.matchId ?? event.match_id ?? "unknown");
-  const messageId = liveMessageIndex.get(matchId);
-  const demoLink = event.demoUrl ?? event.demo_url ?? "not uploaded";
+function panelMarker(key: PanelKey): string {
+  return `fraghub-panel:${key}`;
+}
 
-  if (!messageId) {
-    const embed = new EmbedBuilder()
-      .setTitle("MATCH FINISHED")
-      .addFields(
-        { name: "Match", value: matchId, inline: true },
-        { name: "Final Score", value: String(event.finalScore ?? "0-0"), inline: true },
-        { name: "Demo", value: demoLink }
-      );
-    await channel.send({ embeds: [embed] });
-    return;
-  }
-
-  const msg = await channel.messages.fetch(messageId);
-  const finishedEmbed = new EmbedBuilder()
-    .setTitle("LIVE MATCH")
-    .addFields(
-      { name: "Match", value: matchId, inline: true },
-      { name: "Status", value: "Finished", inline: true },
-      { name: "Final Score", value: String(event.finalScore ?? "0-0"), inline: true },
-      { name: "Demo", value: demoLink }
-    );
-  await msg.edit({ embeds: [finishedEmbed], components: [] });
-
-  const temp = matchChannels.get(matchId);
-  if (temp) {
-    const matchChannel = await getChannel(temp.channelId);
-    if (matchChannel) {
-      const finalScore = event.finalScore ?? "0-0";
-      await matchChannel.send(
-        {
-          embeds: [
-            new EmbedBuilder()
-              .setTitle("Match Complete")
-              .setDescription("Match channel cleanup in progress.")
-              .addFields(
-                { name: "Final Score", value: finalScore, inline: true },
-                { name: "Demo", value: demoLink }
-              )
-          ]
-        }
-      );
-      setTimeout(async () => {
-        try {
-          await matchChannel.delete("Match completed: cleanup temporary channel");
-        } catch (error) {
-          console.error("failed to delete temporary match channel", error);
-        }
-      }, 30 * 1000);
+function parsePanelKey(marker?: string | null): PanelKey | null {
+  if (!marker) return null;
+  const prefix = "fraghub-panel:";
+  if (!marker.startsWith(prefix)) return null;
+  const value = marker.slice(prefix.length);
+  if (value === "verify" || value === "queue" || value === "mapVote" || value === "serverStatus") return value;
+  return null;
+}
+async function findExistingPanelMessage(channel: TextChannel, key: PanelKey): Promise<Message | null> {
+  const knownId = panelMessageIds.get(key);
+  if (knownId) {
+    try {
+      return await channel.messages.fetch(knownId);
+    } catch {
+      panelMessageIds.delete(key);
     }
-    matchChannels.delete(matchId);
+  }
+
+  const pinned = await channel.messages.fetchPinned();
+  const fromPinned = pinned.find((m) => parsePanelKey(m.embeds[0]?.footer?.text) === key);
+  if (fromPinned) {
+    panelMessageIds.set(key, fromPinned.id);
+    return fromPinned;
+  }
+
+  const recent = await channel.messages.fetch({ limit: 50 });
+  const found = recent.find((m) => parsePanelKey(m.embeds[0]?.footer?.text) === key);
+  if (found) panelMessageIds.set(key, found.id);
+  return found ?? null;
+}
+
+async function cleanupManagedChannel(channel: TextChannel, keepMessageId: string): Promise<void> {
+  const messages = await channel.messages.fetch({ limit: 100 });
+  for (const message of messages.values()) {
+    if (message.id === keepMessageId) continue;
+    await safeDeleteMessage(message);
   }
 }
 
-async function postCaseCreated(event: any): Promise<void> {
-  const channel = await getChannel(overwatchChannelId);
+async function upsertPanel(key: PanelKey, payload: { embed: EmbedBuilder; components?: ActionRowBuilder<ButtonBuilder>[] }): Promise<void> {
+  const channelId =
+    key === "verify" ? channelIds.verify : key === "queue" ? channelIds.queue : key === "mapVote" ? channelIds.mapVote : channelIds.serverStatus;
+
+  const channel = await getTextChannel(channelId);
   if (!channel) return;
-  const embed = new EmbedBuilder()
-    .setTitle("New Overwatch Case")
+
+  payload.embed.setFooter({ text: panelMarker(key) });
+  const existing = await findExistingPanelMessage(channel, key);
+  const panelMessage = existing
+    ? await existing.edit({ embeds: [payload.embed], components: payload.components ?? [] })
+    : await channel.send({ embeds: [payload.embed], components: payload.components ?? [] });
+
+  panelMessageIds.set(key, panelMessage.id);
+  if (!panelMessage.pinned) {
+    await panelMessage.pin().catch(() => undefined);
+  }
+  await cleanupManagedChannel(channel, panelMessage.id);
+}
+
+async function getVerificationStatus(discordId: string): Promise<any | null> {
+  try {
+    return await botApi(`/internal/verification/status/${discordId}`);
+  } catch {
+    return null;
+  }
+}
+
+async function updateVerificationRoles(discordId: string, status: any | null): Promise<void> {
+  if (!guildId || !discordId) return;
+  try {
+    const guild = await client.guilds.fetch(guildId);
+    const member = await guild.members.fetch(discordId);
+    const verified = Boolean(status?.verified);
+    const hasUsername = Boolean(status?.username);
+
+    if (roleIds.unverified && verified && member.roles.cache.has(roleIds.unverified)) {
+      await member.roles.remove(roleIds.unverified).catch(() => undefined);
+    }
+    if (roleIds.steamVerified && verified && !member.roles.cache.has(roleIds.steamVerified)) {
+      await member.roles.add(roleIds.steamVerified).catch(() => undefined);
+    }
+    if (roleIds.verified && verified && hasUsername && !member.roles.cache.has(roleIds.verified)) {
+      await member.roles.add(roleIds.verified).catch(() => undefined);
+    }
+
+    const displayName = String(status?.display_name ?? "").trim();
+    if (displayName) {
+      await member.setNickname(displayName).catch(() => undefined);
+    }
+  } catch {
+    // no-op
+  }
+}
+
+async function buildVerifyPanelEmbed(): Promise<EmbedBuilder> {
+  return new EmbedBuilder()
+    .setTitle("FragHub Verification")
+    .setDescription([
+      "1. Click Verify Now",
+      "2. Solve captcha",
+      "3. Link Steam",
+      "4. Set username with /username <name>",
+      "",
+      "Only verified users can fully use matchmaking features."
+    ].join("\n"));
+}
+
+async function buildQueuePanelEmbed(): Promise<EmbedBuilder> {
+  const modes = ["ranked", "wingman", "casual", "clanwars"] as const;
+  const fields: Array<{ name: string; value: string; inline: boolean }> = [];
+  for (const mode of modes) {
+    try {
+      const status = await api(`/queue/status?mode=${mode}`);
+      fields.push({ name: mode.toUpperCase(), value: `In queue: ${status.size ?? 0}\nNeeded: ${status.needed ?? 0}`, inline: true });
+    } catch {
+      fields.push({ name: mode.toUpperCase(), value: "Unavailable", inline: true });
+    }
+  }
+  return new EmbedBuilder().setTitle("FragHub Queue").setDescription("Use buttons below to join/leave queue.").addFields(fields);
+}
+
+async function buildMapVotePanelEmbed(): Promise<EmbedBuilder> {
+  try {
+    const daily = await api("/maps/daily");
+    const maps = Array.isArray(daily?.maps) ? daily.maps : [];
+    return new EmbedBuilder().setTitle("Daily Map Pool").setDescription(maps.length ? maps.map((m: string) => `- ${m}`).join("\n") : "No active map pool.");
+  } catch {
+    return new EmbedBuilder().setTitle("Daily Map Pool").setDescription("Map pool unavailable.");
+  }
+}
+
+async function fetchPresenceStats(force = false): Promise<PresenceStats> {
+  const now = Date.now();
+  if (!force && presenceCache && now - presenceCache.fetchedAt < 10_000) return presenceCache.stats;
+
+  const stats: PresenceStats = { liveMatches: 0, serversOnline: 0, playersQueue: 0 };
+
+  try {
+    const live = await api("/matches/live");
+    stats.liveMatches = Array.isArray(live) ? live.length : 0;
+  } catch {}
+
+  try {
+    const servers = await serverApi("/servers");
+    stats.serversOnline = Array.isArray(servers) ? servers.filter((s: any) => String(s.state ?? "") === "running").length : 0;
+  } catch {}
+
+  try {
+    for (const mode of ["ranked", "wingman", "casual", "clanwars"] as const) {
+      const status = await api(`/queue/status?mode=${mode}`);
+      stats.playersQueue += Number(status?.size ?? 0);
+    }
+  } catch {}
+
+  presenceCache = { stats, fetchedAt: now };
+  return stats;
+}
+
+async function buildServerStatusPanelEmbed(): Promise<EmbedBuilder> {
+  const stats = await fetchPresenceStats();
+  return new EmbedBuilder()
+    .setTitle("FragHub Server Status")
+    .setDescription("Live platform health and activity")
     .addFields(
-      { name: "Case ID", value: String(event.case.id), inline: true },
-      { name: "Player ID", value: String(event.case.reported_player_id), inline: true },
-      { name: "Match ID", value: String(event.case.match_id), inline: true },
-      { name: "Demo", value: String(event.case.demo_url ?? "pending") }
-    );
+      { name: "Live Matches", value: String(stats.liveMatches), inline: true },
+      { name: "Servers Online", value: String(stats.serversOnline), inline: true },
+      { name: "Players in Queue", value: String(stats.playersQueue), inline: true }
+    )
+    .setTimestamp(new Date());
+}
+
+function verifyPanelButtons(): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("verify_now").setLabel("Verify Now").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("verify_check").setLabel("Check Verification").setStyle(ButtonStyle.Primary)
+    )
+  ];
+}
+
+function queuePanelButtons(): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId("queue_join_ranked").setLabel("Join Ranked").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("queue_join_wingman").setLabel("Join Wingman").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("queue_join_casual").setLabel("Join Casual").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("queue_join_clanwars").setLabel("Join Clan Wars").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("queue_leave").setLabel("Leave Queue").setStyle(ButtonStyle.Danger)
+    )
+  ];
+}
+
+function mapVotePanelButtons(): ActionRowBuilder<ButtonBuilder>[] {
+  return [new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId("mapvote_refresh").setLabel("Refresh").setStyle(ButtonStyle.Primary))];
+}
+
+async function refreshPanels(): Promise<void> {
+  await upsertPanel("verify", { embed: await buildVerifyPanelEmbed(), components: verifyPanelButtons() });
+  await upsertPanel("queue", { embed: await buildQueuePanelEmbed(), components: queuePanelButtons() });
+  await upsertPanel("mapVote", { embed: await buildMapVotePanelEmbed(), components: mapVotePanelButtons() });
+  await upsertPanel("serverStatus", { embed: await buildServerStatusPanelEmbed() });
+}
+
+async function postToChannel(channelId: string, embed: EmbedBuilder): Promise<void> {
+  const channel = await getTextChannel(channelId);
+  if (!channel) return;
   await channel.send({ embeds: [embed] });
 }
-
-async function postCheatAlert(event: any): Promise<void> {
-  const overwatchChannel = await getChannel(overwatchChannelId);
-  const statusChannel = await getChannel(serverStatusChannelId);
-  const text = [
-    `**CHEAT ALERT**`,
-    `Player ID: ${event.player_id}`,
-    `Match ID: ${event.match_id}`,
-    `Suspicion Score: ${event.suspicion_score}`,
-    `Reasons: ${(event.reasons ?? []).join(", ") || "n/a"}`
-  ].join("\n");
-
-  if (overwatchChannel) {
-    await overwatchChannel.send({ embeds: [new EmbedBuilder().setTitle("CHEAT ALERT").setDescription(text)] });
-  }
-  if (statusChannel) {
-    await statusChannel.send({
-      embeds: [new EmbedBuilder().setTitle("Server Alert").setDescription(`Cheat alert for player ${event.player_id} (score ${event.suspicion_score})`)]
-    });
-  }
-}
-
-async function postServerStatus(text: string): Promise<void> {
-  const channel = await getChannel(serverStatusChannelId);
-  if (!channel) return;
-  await channel.send({ embeds: [new EmbedBuilder().setTitle("Server Status").setDescription(text)] });
-}
-
-async function postQueueStatus(text: string): Promise<void> {
-  const channel = await getChannel(queueChannelId);
-  if (!channel) return;
-  await channel.send({
-    embeds: [new EmbedBuilder().setTitle("Queue Update").setDescription(text)],
-    components: [linkRow("Open Queue", `${process.env.BASE_URL ?? "https://play.maro.run"}/queue`)]
-  });
-}
-
-function linkRow(label: string, url: string): ActionRowBuilder<ButtonBuilder> {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel(label).setURL(url)
-  );
-}
-
-function utcDateString(d = new Date()): string {
-  return d.toISOString().slice(0, 10);
-}
-
-function msUntilNextUtcMidnight(): number {
-  const now = new Date();
-  const next = new Date(now);
-  next.setUTCHours(24, 0, 0, 0);
-  return next.getTime() - now.getTime();
-}
-
-function voteSortWithRandomTie(a: [string, number], b: [string, number]): number {
-  if (b[1] !== a[1]) return b[1] - a[1];
-  return Math.random() < 0.5 ? -1 : 1;
-}
-
-async function finalizeDailyMapVote() {
-  const state = dailyMapVoteState;
-  if (!state) return;
-  dailyMapVoteState = null;
-
-  const ranked = Object.entries(state.votes).sort(voteSortWithRandomTie);
-  const selected = ranked.slice(0, 5).map(([map]) => map);
-
-  await api("/internal/maps/daily", {
-    method: "POST",
-    headers: { "x-bot-token": botApiToken },
-    body: JSON.stringify({ date: state.date, maps: selected })
-  });
-
-  const channel = await getChannel(state.channelId);
-  if (channel) {
-    await channel.send({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("Daily Map Pool Finalized")
-          .setDescription(`Daily voting closed for ${state.date}.`)
-          .addFields(
-            { name: "Top 5 Maps", value: selected.join(", ") || "n/a" },
-            { name: "Votes", value: ranked.map(([m, c]) => `${m}=${c}`).join(", ") || "n/a" }
-          )
-      ],
-      components: [linkRow("Open Live Matches", `${process.env.BASE_URL ?? "https://play.maro.run"}/live`)]
-    });
-  }
-}
-
-async function startDailyMapVote() {
-  const channel = await getChannel(mapVoteChannelId);
-  if (!channel) return;
-
-  const date = utcDateString();
-  const embed = new EmbedBuilder()
-    .setTitle("DAILY MAP POOL VOTE")
-    .setDescription("Vote for today's map pool. Voting lasts 12 hours.")
-    .addFields({ name: "Date (UTC)", value: date, inline: true });
-
-  const row1 = new ActionRowBuilder<ButtonBuilder>();
-  const row2 = new ActionRowBuilder<ButtonBuilder>();
-  COMMUNITY_MAPS.forEach((map, idx) => {
-    const btn = new ButtonBuilder()
-      .setCustomId(`dailymap:${date}:${map}`)
-      .setLabel(map.replace("de_", "").toUpperCase())
-      .setStyle(ButtonStyle.Secondary);
-    if (idx < 5) row1.addComponents(btn);
-    else row2.addComponents(btn);
-  });
-
-  await channel.send({ embeds: [embed], components: [row1, row2] });
-
-  const votes: Record<string, number> = {};
-  COMMUNITY_MAPS.forEach((m) => (votes[m] = 0));
-  const endTimer = setTimeout(async () => {
-    await finalizeDailyMapVote();
-  }, 12 * 60 * 60 * 1000);
-
-  dailyMapVoteState = {
-    date,
-    channelId: channel.id,
-    votes,
-    votedUsers: new Set<string>(),
-    endTimer
-  };
-}
-
-function scheduleDailyMapVoteLoop() {
-  const delay = msUntilNextUtcMidnight();
-  setTimeout(async () => {
-    try {
-      await startDailyMapVote();
-    } catch (error) {
-      console.error("daily map vote failed", error);
-    } finally {
-      scheduleDailyMapVoteLoop();
-    }
-  }, delay);
-}
-
-function mapLabel(map: string): string {
-  return map.replace(/^de_/, "").replace(/_/g, " ");
-}
-
-function balanceTeamsByElo(players: Array<{ player_id: string; elo: number; region: string; timestamp: string }>) {
-  const ordered = [...players].sort((a, b) => b.elo - a.elo);
-  const teamA: typeof players = [];
-  const teamB: typeof players = [];
-  let eloA = 0;
-  let eloB = 0;
-
-  for (const p of ordered) {
-    const canA = teamA.length < 5;
-    const canB = teamB.length < 5;
-    if (canA && (!canB || eloA <= eloB)) {
-      teamA.push(p);
-      eloA += p.elo;
-    } else {
-      teamB.push(p);
-      eloB += p.elo;
-    }
-  }
-
-  return { teamA, teamB };
-}
-
-function mapEmoji(map: string): string {
-  const key = map.toLowerCase();
-  const emojis: Record<string, string> = {
-    de_mirage: "🟢",
-    de_inferno: "🔴",
-    de_dust2: "🟡",
-    de_ancient: "🔵",
-    de_nuke: "⚫",
-    de_overpass: "🟣",
-    de_vertigo: "🟠"
-  };
-  return emojis[key] ?? "🗺️";
-}
-
-function buildMapVoteRows(matchId: string, maps: string[], disabled = false): ActionRowBuilder<ButtonBuilder>[] {
-  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
-  let currentRow = new ActionRowBuilder<ButtonBuilder>();
-  maps.forEach((map, idx) => {
-    if (idx > 0 && idx % 5 === 0) {
-      rows.push(currentRow);
-      currentRow = new ActionRowBuilder<ButtonBuilder>();
-    }
-    currentRow.addComponents(
-      new ButtonBuilder()
-        .setCustomId(`mapvote:${matchId}:${map}`)
-        .setLabel(mapLabel(map))
-        .setStyle(ButtonStyle.Primary)
-        .setDisabled(disabled)
-    );
-  });
-  rows.push(currentRow);
-  return rows;
-}
-
-function buildMapVoteEmbed(matchId: string, maps: string[], votes: Record<string, number>, winnerMap?: string): EmbedBuilder {
-  const lines = maps.map((m) => {
-    const prefix = winnerMap === m ? "🏆" : mapEmoji(m);
-    return `${prefix} ${mapLabel(m)} - **${votes[m] ?? 0}**`;
-  });
-
-  return new EmbedBuilder()
-    .setTitle("🗺️ Map Vote")
-    .setDescription(lines.join("\n"))
-    .addFields(
-      { name: "Match ID", value: matchId, inline: true },
-      { name: "Status", value: winnerMap ? `Winner: ${mapEmoji(winnerMap)} ${mapLabel(winnerMap)}` : "Voting live", inline: true }
-    );
-}
-
-async function createMatchVoteChannel(event: any): Promise<void> {
-  if (!guildId) return;
-  const guild = await client.guilds.fetch(guildId);
-  const matchId = String(event.matchId ?? "unknown");
-  const maps: string[] = Array.isArray(event.daily_map_pool) && event.daily_map_pool.length > 0 ? event.daily_map_pool : ["de_mirage"];
-  const playerIds: string[] = Array.isArray(event.players) ? event.players : [];
-  const allowedDiscordUsers = playerIds.map((id) => playerDiscordMap[id]).filter(Boolean);
-
-  await api("/internal/matches/reserve", {
-    method: "POST",
-    body: JSON.stringify({
-      match_id: matchId,
-      teamA: event.team_a ?? [],
-      teamB: event.team_b ?? []
-    })
-  });
-
-  const channel = await guild.channels.create({
-    name: `match-${matchId.slice(0, 8)}`,
-    permissionOverwrites: [
-      {
-        id: guild.roles.everyone.id,
-        deny: [PermissionFlagsBits.ViewChannel]
-      },
-      ...(moderatorRoleId
-        ? [
-            {
-              id: moderatorRoleId,
-              allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
-            }
-          ]
-        : []),
-      ...allowedDiscordUsers.map((discordUserId) => ({
-        id: discordUserId,
-        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
-      }))
-    ],
-    reason: `Temporary vote channel for match ${matchId}`
-  });
-
-  const embed = buildMapVoteEmbed(matchId, maps, Object.fromEntries(maps.map((m) => [m, 0])));
-  const rows = buildMapVoteRows(matchId, maps, false);
-
-  const voteMessage = await (channel as TextChannel).send({ embeds: [embed], components: rows });
-
-  const votes: Record<string, number> = {};
-  maps.forEach((m) => {
-    votes[m] = 0;
-  });
-
-  const timer = setTimeout(async () => {
-    const voteState = matchVotes.get(matchId);
-    if (!voteState) return;
-    matchVotes.delete(matchId);
-
-    const highest = Math.max(...Object.values(voteState.votes));
-    const tied = Object.keys(voteState.votes).filter((m) => voteState.votes[m] === highest);
-    const selectedMap = tied[Math.floor(Math.random() * tied.length)];
-
-    try {
-      const voteMsg = await (channel as TextChannel).messages.fetch(voteState.voteMessageId);
-      await voteMsg.edit({
-        embeds: [buildMapVoteEmbed(matchId, voteState.maps, voteState.votes, selectedMap)],
-        components: buildMapVoteRows(matchId, voteState.maps, true)
-      });
-    } catch (error) {
-      console.error("failed to finalize map vote embed", error);
-    }
-
-    const server = await serverApi("/server/start", {
-      method: "POST",
-      body: JSON.stringify({
-        match_id: matchId,
-        map: selectedMap
-      })
-    });
-
-    await api("/internal/matches/activate", {
-      method: "POST",
-      body: JSON.stringify({
-        match_id: matchId,
-        map: selectedMap,
-        server: {
-          serverId: server.serverId ?? server.server_id,
-          ip: server.ip ?? server.server_ip,
-          port: server.port,
-          serverPassword: server.serverPassword ?? server.server_password ?? server.password,
-          spectatorPassword: server.spectatorPassword ?? server.spectator_password,
-          connectString: server.connectString ?? server.connect_string
-        }
-      })
-    });
-
-    const connectCommand =
-      server.connectString ??
-      server.connect_string ??
-      `connect ${server.server_ip ?? server.ip}:${server.port}; password ${server.password ?? server.server_password}`;
-    await (channel as TextChannel).send(
-      [
-        `Map selected: **${selectedMap}**`,
-        `Votes: ${Object.entries(voteState.votes)
-          .map(([m, c]) => `${m}=${c}`)
-          .join(", ")}`,
-        "",
-        connectCommand,
-        "",
-        "Match updates will be posted in this channel."
-      ].join("\n")
-    );
-
-    if (voteState.simulateEnd) {
-      setTimeout(async () => {
-        try {
-          const scoreA = 13;
-          const scoreB = 8;
-          const winner = scoreA >= scoreB ? "A" : "B";
-          const results = [...voteState.teamA, ...voteState.teamB].map((p: any) => ({
-            player_id: p.player_id,
-            result: (voteState.teamA.find((x: any) => x.player_id === p.player_id) ? "A" : "B") === winner ? "win" : "loss",
-            adr: (voteState.teamA.find((x: any) => x.player_id === p.player_id) ? "A" : "B") === winner ? 100 : 75,
-            mvps: (voteState.teamA.find((x: any) => x.player_id === p.player_id) ? "A" : "B") === winner ? 2 : 0,
-            kd: (voteState.teamA.find((x: any) => x.player_id === p.player_id) ? "A" : "B") === winner ? 1.4 : 0.85
-          }));
-
-          await api(`/internal/matches/${matchId}/end`, {
-            method: "POST",
-            body: JSON.stringify({
-              demoUrl: `https://play.maro.run/demos/${matchId}.dem`,
-              teamAScore: scoreA,
-              teamBScore: scoreB,
-              results
-            })
-          });
-        } catch (error) {
-          console.error("test match end simulation failed", error);
-        }
-      }, 30_000);
-    }
-  }, 15_000);
-
-  matchVotes.set(matchId, {
-    matchId,
-    channelId: channel.id,
-    voteMessageId: voteMessage.id,
-    teamA: event.team_a ?? [],
-    teamB: event.team_b ?? [],
-    maps,
-    votes,
-    votedUsers: new Set<string>(),
-    simulateEnd: Boolean(event.test_mode),
-    timer
-  });
-  matchChannels.set(matchId, {
-    channelId: channel.id,
-    playerIds
-  });
-}
-
-async function setPlayerSkin(steamId: string, weapon: string, skinId: string): Promise<void> {
-  await api("/player/skins", {
-    method: "POST",
-    headers: {
-      "x-bot-token": botApiToken
-    },
-    body: JSON.stringify({
-      steam_id: steamId,
-      weapon,
-      skin_id: skinId
-    })
-  });
-}
-
-function makeWeaponMenu(steamId: string): ActionRowBuilder<StringSelectMenuBuilder> {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`skins:weapon:${steamId}`)
-    .setPlaceholder("Select weapon category")
-    .addOptions([
-      { label: "AK47", value: "ak47" },
-      { label: "M4A1-S", value: "m4a1-s" },
-      { label: "AWP", value: "awp" },
-      { label: "Knife", value: "knife" },
-      { label: "Gloves", value: "gloves" }
-    ]);
-
-  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-}
-
-function makeSkinMenu(steamId: string, weapon: string): ActionRowBuilder<StringSelectMenuBuilder> {
-  const skins = SKINS_CATALOG[weapon] ?? [];
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`skins:skin:${steamId}:${weapon}`)
-    .setPlaceholder(`Select ${weapon} skin`)
-    .addOptions(
-      skins.map((s) => ({
-        label: s.name,
-        value: s.id
-      }))
-    );
-
-  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-}
-
-async function handleSlashSkins(interaction: ChatInputCommandInteraction): Promise<void> {
-  const steamId = interaction.options.getString("steamid", true);
-  await interaction.reply({
-    content: `Skin selection for **${steamId}**`,
-    components: [makeWeaponMenu(steamId)],
-    ephemeral: true
-  });
-}
-
-async function handleSlashQueue(interaction: ChatInputCommandInteraction): Promise<void> {
-  const steamId = interaction.options.getString("steamid", true);
-  const action = interaction.options.getString("action") ?? "join";
-  const region = interaction.options.getString("region") ?? "eu";
-
-  if (action === "leave") {
-    const result = await api("/internal/queue/leave", {
-      method: "POST",
-      headers: { "x-bot-token": botApiToken },
-      body: JSON.stringify({ steam_id: steamId })
-    });
-    await interaction.reply({ content: `Removed **${steamId}** from queue. Queue size: ${result.size}`, ephemeral: true });
+async function handleVerifyCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const status = await getVerificationStatus(interaction.user.id);
+  if (!status?.verified) {
+    await interaction.reply({ content: "Click Verify Now in #verify and complete captcha + Steam link.", ephemeral: true });
     return;
   }
 
-  const result = await api("/internal/queue/join", {
-    method: "POST",
-    headers: { "x-bot-token": botApiToken },
-    body: JSON.stringify({ steam_id: steamId, region })
-  });
-  await interaction.reply({
-    content: `Queued **${steamId}** (${region}). Queue size: ${result.size}${result.duplicate ? " (already queued)" : ""}`,
-    ephemeral: true
-  });
+  if (!status.username) {
+    await interaction.reply({ content: "Steam linked. Set your username with /username <name>.", ephemeral: true });
+    return;
+  }
+
+  await updateVerificationRoles(interaction.user.id, status);
+  await interaction.reply({ content: `Verified as ${status.display_name ?? status.username}.`, ephemeral: true });
 }
 
-async function handleSlashTestMatch(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.deferReply({ ephemeral: true });
-
-  const fake = await api("/internal/test/fake-players", {
+async function handleUsernameCreate(interaction: ChatInputCommandInteraction): Promise<void> {
+  const username = interaction.options.getString("name", true);
+  const result = await userApi("/internal/player/username", interaction.user.id, {
     method: "POST",
-    headers: { "x-bot-token": botApiToken },
-    body: JSON.stringify({ count: 10, region: "eu" })
+    body: JSON.stringify({ username })
   });
-  const players = fake.players as Array<{ player_id: string; elo: number; region: string; timestamp: string }>;
-  const { teamA, teamB } = balanceTeamsByElo(players);
-  const mapsData = await api("/maps/daily");
-  const matchId = crypto.randomUUID();
-
-  await createMatchVoteChannel({
-    matchId,
-    players: players.map((p) => p.player_id),
-    team_a: teamA,
-    team_b: teamB,
-    daily_map_pool: mapsData.maps,
-    test_mode: true
-  });
-
-  await interaction.editReply(`Test match started: ${matchId}. Simulated flow is now running.`);
+  const status = await getVerificationStatus(interaction.user.id);
+  await updateVerificationRoles(interaction.user.id, status);
+  await interaction.reply({ content: `Username set: ${result.username}`, ephemeral: true });
 }
 
-async function handleSlashMatchEnd(interaction: ChatInputCommandInteraction): Promise<void> {
+async function handleUsernameChange(interaction: ChatInputCommandInteraction): Promise<void> {
+  const username = interaction.options.getString("newname", true);
+  const result = await userApi("/internal/player/username/change", interaction.user.id, {
+    method: "POST",
+    body: JSON.stringify({ username })
+  });
+  const status = await getVerificationStatus(interaction.user.id);
+  await updateVerificationRoles(interaction.user.id, status);
+  await interaction.reply({ content: `Username changed: ${result.username}`, ephemeral: true });
+}
+
+async function handleTagChange(interaction: ChatInputCommandInteraction): Promise<void> {
+  const tagType = interaction.options.getString("type", true);
+  const result = await userApi("/internal/player/tag", interaction.user.id, {
+    method: "POST",
+    body: JSON.stringify({ selected_tag_type: tagType })
+  });
+  const status = await getVerificationStatus(interaction.user.id);
+  await updateVerificationRoles(interaction.user.id, status);
+  await interaction.reply({ content: `Tag changed: ${result.display_name}`, ephemeral: true });
+}
+
+async function resolveSteamIdForDiscord(discordId: string): Promise<string | null> {
+  const status = await getVerificationStatus(discordId);
+  if (!status?.verified || !status?.steam_id) return null;
+  return String(status.steam_id);
+}
+
+async function handleQueueCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const action = interaction.options.getString("action") ?? "join";
+  const mode = interaction.options.getString("mode") ?? "ranked";
+  const region = interaction.options.getString("region") ?? defaultRegion;
+  const steamId = await resolveSteamIdForDiscord(interaction.user.id);
+
+  if (!steamId) {
+    await interaction.reply({ content: "You must complete verification first.", ephemeral: true });
+    return;
+  }
+
+  if (action === "leave") {
+    const result = await userApi("/internal/queue/leave", interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({ steam_id: steamId, mode })
+    });
+    await interaction.reply({ content: `Left ${mode} queue. Size: ${result.size ?? 0}`, ephemeral: true });
+  } else {
+    const result = await userApi("/internal/queue/join", interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({ steam_id: steamId, mode, region })
+    });
+    await interaction.reply({ content: `Joined ${mode} queue. Size: ${result.size ?? 0}`, ephemeral: true });
+  }
+
+  await upsertPanel("queue", { embed: await buildQueuePanelEmbed(), components: queuePanelButtons() });
+}
+
+async function handleClanCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const subCommand = interaction.options.getSubcommand(true);
+
+  if (subCommand === "create") {
+    const clanName = interaction.options.getString("name", true);
+    const clanTag = interaction.options.getString("tag", true);
+    const res = await userApi("/internal/clan/create-request", interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({ clan_name: clanName, clan_tag: clanTag })
+    });
+    await interaction.reply({ content: `Clan request sent: ${res.clan_tag} (${res.status})`, ephemeral: true });
+    return;
+  }
+
+  if (subCommand === "join") {
+    const clanTag = interaction.options.getString("tag", true);
+    const res = await userApi("/internal/clan/join-request", interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({ clan_tag: clanTag })
+    });
+    await interaction.reply({ content: `Join request sent to [${res.clan_tag}] ${res.clan_name}.`, ephemeral: true });
+    return;
+  }
+
+  if (subCommand === "approve") {
+    const player = interaction.options.getString("player", true);
+    const res = await userApi("/internal/clan/approve-member", interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({ player })
+    });
+    await interaction.reply({ content: `Approved ${res.player_steam_id} into ${res.clan_tag}.`, ephemeral: true });
+    return;
+  }
+
+  if (subCommand === "invite") {
+    const player = interaction.options.getString("player", true);
+    const res = await userApi("/internal/clan/invite", interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({ player })
+    });
+    await interaction.reply({ content: `Invited ${res.player_steam_id} into ${res.clan_tag}.`, ephemeral: true });
+    return;
+  }
+
+  if (subCommand === "kick") {
+    const player = interaction.options.getString("player", true);
+    const res = await userApi("/internal/clan/kick", interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({ player })
+    });
+    await interaction.reply({ content: `Kicked ${res.player_steam_id} from ${res.clan_tag}.`, ephemeral: true });
+    return;
+  }
+
+  if (subCommand === "leave") {
+    const res = await userApi("/internal/clan/leave", interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    await interaction.reply({ content: res.disbanded ? "Clan disbanded." : "You left the clan.", ephemeral: true });
+    return;
+  }
+
+  if (subCommand === "info") {
+    const tag = interaction.options.getString("tag");
+    const steamId = await resolveSteamIdForDiscord(interaction.user.id);
+    const query = tag
+      ? `/internal/clan/info?tag=${encodeURIComponent(tag)}`
+      : steamId
+      ? `/internal/clan/info?steam_id=${encodeURIComponent(steamId)}`
+      : "";
+
+    if (!query) {
+      await interaction.reply({ content: "Verify first or provide /clan info <tag>", ephemeral: true });
+      return;
+    }
+
+    const res = await botApi(query);
+    await interaction.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle(`[${res.clan.clan_tag}] ${res.clan.clan_name}`)
+          .setDescription([
+            `Rating: ${res.rating.rating}`,
+            `Rank: ${res.rating.rank ?? "-"}`,
+            `W/L: ${res.rating.wins}/${res.rating.losses}`,
+            `Matches: ${res.rating.matches_played}`,
+            `Members: ${(res.members ?? []).length}`
+          ].join("\n"))
+      ],
+      ephemeral: true
+    });
+    return;
+  }
+
+  if (subCommand === "leaderboard") {
+    const limit = interaction.options.getInteger("limit") ?? 10;
+    const res = await botApi(`/internal/clan/leaderboard?limit=${limit}`);
+    const lines = (res.leaderboard ?? []).map((r: any) => `#${r.rank} ${r.clan_tag} - ${r.rating}`);
+    await interaction.reply({ embeds: [new EmbedBuilder().setTitle("Clan Leaderboard").setDescription(lines.join("\n") || "No data")], ephemeral: true });
+    return;
+  }
+
+  if (subCommand === "request-approve") {
+    const requestId = interaction.options.getString("request_id", true);
+    const res = await userApi(`/internal/clan/request/${requestId}/approve`, interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    await interaction.reply({ content: `Approved clan request: ${res.clan_tag}`, ephemeral: true });
+    return;
+  }
+
+  if (subCommand === "request-reject") {
+    const requestId = interaction.options.getString("request_id", true);
+    const reason = interaction.options.getString("reason") ?? "Rejected";
+    await userApi(`/internal/clan/request/${requestId}/reject`, interaction.user.id, {
+      method: "POST",
+      body: JSON.stringify({ reason })
+    });
+    await interaction.reply({ content: "Clan request rejected.", ephemeral: true });
+  }
+}
+async function handleSkinsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const steamId = interaction.options.getString("steamid", true);
+  const weapon = interaction.options.getString("weapon", true);
+  const skin = interaction.options.getString("skin", true);
+
+  await botApi("/player/skins", {
+    method: "POST",
+    body: JSON.stringify({ steam_id: steamId, weapon, skin_id: skin })
+  });
+
+  await interaction.reply({ content: `Saved ${weapon} skin: ${skin}`, ephemeral: true });
+}
+
+async function handleMatchEndCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   const matchId = interaction.options.getString("matchid", true);
   const scoreA = interaction.options.getInteger("score_a") ?? 13;
   const scoreB = interaction.options.getInteger("score_b") ?? 8;
   const demoUrl = interaction.options.getString("demo_url") ?? `https://play.maro.run/demos/${matchId}.dem`;
 
-  const match = await api(`/matches/${matchId}`);
-  const players: Array<{ id: string; team: "A" | "B" }> = (match.players ?? []).map((p: any) => ({ id: p.id, team: p.team }));
-  const winner = scoreA >= scoreB ? "A" : "B";
-  const results = players.map((p) => ({
-    player_id: p.id,
-    result: p.team === winner ? "win" : "loss",
-    adr: p.team === winner ? 95 : 72,
-    mvps: p.team === winner ? 2 : 0,
-    kd: p.team === winner ? 1.3 : 0.8
-  }));
-
-  await api(`/internal/matches/${matchId}/end`, {
+  await botApi(`/internal/matches/${matchId}/end`, {
     method: "POST",
-    body: JSON.stringify({
-      demoUrl,
-      teamAScore: scoreA,
-      teamBScore: scoreB,
-      results
-    })
+    body: JSON.stringify({ demoUrl, teamAScore: scoreA, teamBScore: scoreB })
   });
 
-  await interaction.reply({ content: `Marked match ${matchId} as finished (${scoreA}-${scoreB}).`, ephemeral: true });
+  await interaction.reply({ content: `Match ended: ${scoreA}-${scoreB}`, ephemeral: true });
 }
 
-async function handleSkinMenu(interaction: StringSelectMenuInteraction): Promise<void> {
-  const [scope, type, steamId, weapon] = interaction.customId.split(":");
-  if (scope !== "skins") return;
+async function handleTestMatchCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  await interaction.reply({ content: "Use existing /testmatch flow from matchmaker integration.", ephemeral: true });
+}
 
-  if (type === "weapon") {
-    const selectedWeapon = interaction.values[0];
-    await interaction.update({
-      content: `Skin selection for **${steamId}**\nWeapon: **${selectedWeapon.toUpperCase()}**`,
-      components: [makeSkinMenu(steamId, selectedWeapon)]
-    });
+function createCaptcha(discordId: string): { nonce: string; question: string } {
+  const a = Math.floor(Math.random() * 10) + 1;
+  const b = Math.floor(Math.random() * 10) + 1;
+  const answer = String(a + b);
+  const nonce = crypto.randomBytes(8).toString("hex");
+  captchaState.set(discordId, { nonce, answer, expiresAt: Date.now() + 5 * 60 * 1000 });
+  return { nonce, question: `${a} + ${b}` };
+}
+
+function buildVerifyCaptchaModal(customId: string, question: string): ModalBuilder {
+  const modal = new ModalBuilder().setCustomId(customId).setTitle("FragHub Captcha");
+  const input = new TextInputBuilder()
+    .setCustomId("captcha_answer")
+    .setLabel(`Solve: ${question}`)
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+  modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+  return modal;
+}
+
+async function startVerificationFlow(discordId: string): Promise<string> {
+  const result = await botApi("/internal/verification/start", {
+    method: "POST",
+    body: JSON.stringify({ discord_id: discordId })
+  });
+  return String(result.verify_url ?? result.url);
+}
+
+async function rotatePresence(): Promise<void> {
+  if (!client.user) return;
+
+  const fallback = "FragHub Matchmaking";
+  let messages = [fallback, fallback, fallback, fallback];
+
+  try {
+    const stats = await fetchPresenceStats();
+    messages = [
+      `${stats.liveMatches} Live Matches`,
+      `${stats.serversOnline} Servers Online`,
+      `${stats.playersQueue} Players in Queue`,
+      "FragHub Matchmaking"
+    ];
+  } catch {
+    // no-op
+  }
+
+  const message = messages[presenceIndex % messages.length] ?? fallback;
+  presenceIndex = (presenceIndex + 1) % messages.length;
+
+  await client.user.setPresence({ activities: [{ name: message, type: ActivityType.Watching }], status: "online" });
+}
+
+async function registerCommands(): Promise<void> {
+  if (!client.application) return;
+
+  const commands: any[] = [
+    new SlashCommandBuilder().setName("verify").setDescription("Check verification status"),
+    new SlashCommandBuilder()
+      .setName("username")
+      .setDescription("Set your FragHub username")
+      .addStringOption((opt) => opt.setName("name").setDescription("3-16 letters/numbers/_").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("username-change")
+      .setDescription("Change your username (30 days cooldown)")
+      .addStringOption((opt) => opt.setName("newname").setDescription("New username").setRequired(true)),
+    new SlashCommandBuilder()
+      .setName("tag")
+      .setDescription("Select visible tag")
+      .addStringOption((opt) =>
+        opt
+          .setName("type")
+          .setDescription("Tag type")
+          .setRequired(true)
+          .addChoices(
+            { name: "No Tag", value: "none" },
+            { name: "Clan", value: "clan" },
+            { name: "Developer", value: "dev" },
+            { name: "Admin", value: "admin" },
+            { name: "Moderator", value: "mod" }
+          )
+      ),
+    new SlashCommandBuilder()
+      .setName("queue")
+      .setDescription("Join or leave queue")
+      .addStringOption((opt) =>
+        opt
+          .setName("action")
+          .setDescription("Queue action")
+          .setRequired(false)
+          .addChoices({ name: "join", value: "join" }, { name: "leave", value: "leave" })
+      )
+      .addStringOption((opt) =>
+        opt
+          .setName("mode")
+          .setDescription("Queue mode")
+          .setRequired(false)
+          .addChoices(
+            { name: "ranked", value: "ranked" },
+            { name: "wingman", value: "wingman" },
+            { name: "casual", value: "casual" },
+            { name: "clanwars", value: "clanwars" }
+          )
+      )
+      .addStringOption((opt) => opt.setName("region").setDescription("Region").setRequired(false)),
+    new SlashCommandBuilder().setName("matchend").setDescription("Mark a match as ended and trigger ranking update")
+      .addStringOption((opt) => opt.setName("matchid").setDescription("Match ID").setRequired(true))
+      .addIntegerOption((opt) => opt.setName("score_a").setDescription("Team A score").setRequired(false))
+      .addIntegerOption((opt) => opt.setName("score_b").setDescription("Team B score").setRequired(false))
+      .addStringOption((opt) => opt.setName("demo_url").setDescription("Demo URL").setRequired(false)),
+    new SlashCommandBuilder().setName("skins").setDescription("Set cosmetic skin")
+      .addStringOption((opt) => opt.setName("steamid").setDescription("Steam ID").setRequired(true))
+      .addStringOption((opt) => opt.setName("weapon").setDescription("Weapon").setRequired(true))
+      .addStringOption((opt) => opt.setName("skin").setDescription("Skin id").setRequired(true))
+  ];
+
+  if (enableTestMode) {
+    commands.push(new SlashCommandBuilder().setName("testmatch").setDescription("Run test match flow"));
+  }
+
+  const clanCommand = new SlashCommandBuilder()
+    .setName("clan")
+    .setDescription("Clan management")
+    .addSubcommand((sub) => sub.setName("create").setDescription("Create clan request").addStringOption((opt) => opt.setName("name").setDescription("Clan name").setRequired(true)).addStringOption((opt) => opt.setName("tag").setDescription("Clan tag").setRequired(true)))
+    .addSubcommand((sub) => sub.setName("join").setDescription("Request to join clan").addStringOption((opt) => opt.setName("tag").setDescription("Clan tag").setRequired(true)))
+    .addSubcommand((sub) => sub.setName("approve").setDescription("Owner: approve member").addStringOption((opt) => opt.setName("player").setDescription("Username or SteamID").setRequired(true)))
+    .addSubcommand((sub) => sub.setName("invite").setDescription("Owner: invite member").addStringOption((opt) => opt.setName("player").setDescription("Username or SteamID").setRequired(true)))
+    .addSubcommand((sub) => sub.setName("kick").setDescription("Owner: kick member").addStringOption((opt) => opt.setName("player").setDescription("Username or SteamID").setRequired(true)))
+    .addSubcommand((sub) => sub.setName("leave").setDescription("Leave current clan"))
+    .addSubcommand((sub) => sub.setName("info").setDescription("Show clan info").addStringOption((opt) => opt.setName("tag").setDescription("Clan tag").setRequired(false)))
+    .addSubcommand((sub) => sub.setName("leaderboard").setDescription("Top clans").addIntegerOption((opt) => opt.setName("limit").setDescription("Top N").setRequired(false)))
+    .addSubcommand((sub) => sub.setName("request-approve").setDescription("Staff: approve clan creation request").addStringOption((opt) => opt.setName("request_id").setDescription("Request ID").setRequired(true)))
+    .addSubcommand((sub) => sub.setName("request-reject").setDescription("Staff: reject clan creation request").addStringOption((opt) => opt.setName("request_id").setDescription("Request ID").setRequired(true)).addStringOption((opt) => opt.setName("reason").setDescription("Reason").setRequired(false)));
+
+  commands.push(clanCommand);
+
+  const payload = commands.map((cmd) => cmd.toJSON());
+  if (guildId) await client.application.commands.set(payload, guildId);
+  else await client.application.commands.set(payload);
+}
+async function postLiveMatchEvent(event: any): Promise<void> {
+  const matchId = String(event.matchId ?? event.match_id ?? "unknown");
+  if (event.type === "match_started") {
+    await postToChannel(channelIds.liveMatches, new EmbedBuilder().setTitle("Match Started").setDescription(`Match ${matchId} is now live.`));
+  }
+  if (event.type === "match_finished") {
+    const finalScore = String(event.finalScore ?? "0-0");
+    await postToChannel(channelIds.matchResults || channelIds.liveMatches, new EmbedBuilder().setTitle("Match Finished").setDescription(`Match ${matchId} finished (${finalScore}).`));
+  }
+}
+
+async function handlePubsubEvent(channel: string, event: any): Promise<void> {
+  if (channel === "queue-events") {
+    await upsertPanel("queue", { embed: await buildQueuePanelEmbed(), components: queuePanelButtons() });
     return;
   }
 
-  if (type === "skin") {
-    const selectedSkin = interaction.values[0];
-    if (!weapon) {
-      await interaction.reply({ content: "Invalid weapon selection state.", ephemeral: true });
-      return;
+  if (channel === "match-events") {
+    await postLiveMatchEvent(event);
+    if (event.type === "match_finished") {
+      await upsertPanel("serverStatus", { embed: await buildServerStatusPanelEmbed() });
     }
-
-    await setPlayerSkin(steamId, weapon, selectedSkin);
-    await interaction.update({
-      content: `Saved skin for **${steamId}**\nWeapon: **${weapon.toUpperCase()}**\nSkin: **${selectedSkin}**`,
-      components: []
-    });
+    return;
   }
-}
 
-async function handleCommand(message: Message): Promise<void> {
-  if (!message.content.startsWith("!")) return;
-
-  const [command, ...args] = message.content.trim().split(/\s+/);
-
-  try {
-    if (command === "!servers") {
-      const servers = await serverApi("/servers");
-      if (!Array.isArray(servers) || servers.length === 0) {
-        await message.reply("No active servers.");
-        return;
-      }
-
-      const active = servers.filter((s: any) => s.state === "running");
-      if (active.length === 0) {
-        await message.reply("No active servers.");
-        return;
-      }
-
-      await message.reply(
-        active
-          .map(
-            (s: any) =>
-              `${s.server_id.slice(0, 12)} | ${s.map ?? "unknown"} | ${s.server_ip}:${s.port}`
-          )
-          .join("\n")
+  if (channel === "overwatch-events") {
+    if (event.type === "case_created") {
+      await postToChannel(
+        channelIds.reports || channelIds.cheaterAlerts,
+        new EmbedBuilder().setTitle("Overwatch Case Created").setDescription(`Case ${event.case?.id ?? "?"} for player ${event.case?.reported_player_id ?? "?"}`)
       );
       return;
     }
 
-    if (command === "!match" && args[0]) {
-      const match = await api(`/matches/${args[0]}`);
-      await message.reply([
-        `Match ${match.id}`,
-        `Status: ${match.status}`,
-        `Map: ${match.map}`,
-        `Players: ${(match.players ?? []).map((p: any) => p.display_name ?? p.id).join(", ") || "n/a"}`,
-        `Connect: ${match.connect_string ?? "n/a"}`,
-        `Demo: ${match.demo_url ?? "n/a"}`
-      ].join("\n"));
+    if (event.type === "anti_cheat_alert" || event.type === "cheat_alert" || event.type === "steam_link_flagged") {
+      await postToChannel(channelIds.cheaterAlerts, new EmbedBuilder().setTitle("Cheater Alert").setDescription(`Event: ${event.type}`));
       return;
     }
 
-    if (command === "!case" && args[0]) {
-      const cases = await api("/overwatch/cases", {
-        headers: { authorization: `Bearer ${modJwt}` }
-      });
-      const found = cases.find((c: any) => c.id === args[0] || c.case_id === args[0]);
-      if (!found) {
-        await message.reply("Case not found");
-        return;
-      }
-      await message.reply([
-        `Case: ${found.id ?? found.case_id}`,
-        `Status: ${found.status}`,
-        `Player: ${found.reported_player_id ?? found.player_id}`,
-        `Match: ${found.match_id}`,
-        `Demo: ${found.demo_url ?? "pending"}`
-      ].join("\n"));
+    if (event.type === "ban_evasion_case_updated" && (event.action === "ban" || event.status === "banned")) {
+      await postToChannel(channelIds.banLog, new EmbedBuilder().setTitle("Ban Event").setDescription(`Ban evasion case ${event.case_id} updated to ${event.status}`));
+    }
+    return;
+  }
+
+  if (channel === "moderation-events") {
+    if (event.type === "clan_request_created") {
+      await postToChannel(
+        channelIds.modLog || channelIds.updates,
+        new EmbedBuilder()
+          .setTitle("Clan Request")
+          .setDescription(`Applicant: ${event.applicant_username ?? event.applicant_steam_id}`)
+          .addFields(
+            { name: "Clan Name", value: String(event.clan_name ?? "-"), inline: true },
+            { name: "Clan Tag", value: String(event.clan_tag ?? "-"), inline: true },
+            { name: "Request ID", value: String(event.request_id ?? "-"), inline: false }
+          )
+      );
       return;
     }
 
-    if (command === "!timeout" && args[0]) {
-      await api("/moderation/timeout", {
-        method: "POST",
-        headers: { authorization: `Bearer ${modJwt}` },
-        body: JSON.stringify({ playerId: args[0], minutes: Number(args[1] ?? 30) })
-      });
-      await message.reply(`Timeout applied to ${args[0]}`);
-      return;
+    if (event.type === "clan_request_resolved") {
+      await postToChannel(channelIds.updates, new EmbedBuilder().setTitle("Clan Request Resolved").setDescription(`Request ${event.request_id} ${event.decision}`));
     }
+    return;
+  }
 
-    if (command === "!ban" && args[0]) {
-      await api("/moderation/ban", {
-        method: "POST",
-        headers: { authorization: `Bearer ${modJwt}` },
-        body: JSON.stringify({ playerId: args[0], reason: args.slice(1).join(" ") || "Discord moderation action" })
-      });
-      await message.reply(`Ban applied to ${args[0]}`);
-      return;
-    }
-  } catch (error: any) {
-    await message.reply(`Command failed: ${error.message}`);
+  if (channel === "security-events") {
+    await postToChannel(channelIds.cheaterAlerts, new EmbedBuilder().setTitle("Security Event").setDescription(`${event.type ?? "event"}`));
   }
 }
 
 client.on("ready", async () => {
   console.log(`Discord bot connected as ${client.user?.tag}`);
 
-  if (client.application && guildId) {
-    const skinsCommand = new SlashCommandBuilder()
-      .setName("skins")
-      .setDescription("Select cosmetic skins for your Steam account")
-      .addStringOption((opt) =>
-        opt
-          .setName("steamid")
-          .setDescription("Steam ID (used by game server skin fetch)")
-          .setRequired(true)
-      );
-
-    const queueCommand = new SlashCommandBuilder()
-      .setName("queue")
-      .setDescription("Join or leave the Discord matchmaking queue")
-      .addStringOption((opt) =>
-        opt.setName("steamid").setDescription("Steam ID").setRequired(true)
-      )
-      .addStringOption((opt) =>
-        opt
-          .setName("action")
-          .setDescription("Queue action")
-          .setRequired(false)
-          .addChoices(
-            { name: "join", value: "join" },
-            { name: "leave", value: "leave" }
-          )
-      )
-      .addStringOption((opt) =>
-        opt.setName("region").setDescription("Region").setRequired(false)
-      );
-
-    const matchEndCommand = new SlashCommandBuilder()
-      .setName("matchend")
-      .setDescription("Mark a match as ended and trigger ranking update")
-      .addStringOption((opt) => opt.setName("matchid").setDescription("Match ID").setRequired(true))
-      .addIntegerOption((opt) => opt.setName("score_a").setDescription("Team A score").setRequired(false))
-      .addIntegerOption((opt) => opt.setName("score_b").setDescription("Team B score").setRequired(false))
-      .addStringOption((opt) => opt.setName("demo_url").setDescription("Demo URL").setRequired(false));
-
-    const testMatchCommand = new SlashCommandBuilder()
-      .setName("testmatch")
-      .setDescription("Run a full mock match flow (queue -> vote -> server -> end)");
-
-    await client.application.commands.create(skinsCommand.toJSON(), guildId);
-    await client.application.commands.create(queueCommand.toJSON(), guildId);
-    await client.application.commands.create(matchEndCommand.toJSON(), guildId);
-    if (enableTestMode) {
-      await client.application.commands.create(testMatchCommand.toJSON(), guildId);
-    }
+  if (client.user) {
+    await client.user.setPresence({
+      activities: [{ name: "Starting FragHub systems...", type: ActivityType.Watching }],
+      status: "online"
+    });
   }
 
-  await postServerStatus("Discord bot online.");
-  scheduleDailyMapVoteLoop();
-});
+  await registerCommands();
+  await refreshPanels();
+  await rotatePresence();
 
-client.on("interactionCreate", async (interaction) => {
-  try {
-    if (interaction.isChatInputCommand() && interaction.commandName === "skins") {
-      await handleSlashSkins(interaction);
-      return;
-    }
-    if (interaction.isChatInputCommand() && interaction.commandName === "queue") {
-      await handleSlashQueue(interaction);
-      return;
-    }
-    if (interaction.isChatInputCommand() && interaction.commandName === "matchend") {
-      await handleSlashMatchEnd(interaction);
-      return;
-    }
-    if (interaction.isChatInputCommand() && interaction.commandName === "testmatch") {
-      if (!enableTestMode) {
-        await interaction.reply({ content: "Test mode is disabled.", ephemeral: true });
-        return;
-      }
-      await handleSlashTestMatch(interaction);
-      return;
-    }
+  setInterval(async () => {
+    await rotatePresence().catch(() => undefined);
+  }, 15_000);
 
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith("skins:")) {
-      await handleSkinMenu(interaction);
-      return;
-    }
+  setInterval(async () => {
+    await upsertPanel("serverStatus", { embed: await buildServerStatusPanelEmbed() }).catch(() => undefined);
+  }, 15_000);
 
-    if (interaction.isButton() && interaction.customId.startsWith("mapvote:")) {
-      const [, matchId, map] = interaction.customId.split(":");
-      const voteState = matchVotes.get(matchId);
-      if (!voteState) {
-        await interaction.reply({ content: "Voting has ended for this match.", ephemeral: true });
-        return;
-      }
-
-      if (voteState.channelId !== interaction.channelId) {
-        await interaction.reply({ content: "Invalid voting channel.", ephemeral: true });
-        return;
-      }
-
-      if (voteState.votedUsers.has(interaction.user.id)) {
-        await interaction.reply({ content: "You have already voted.", ephemeral: true });
-        return;
-      }
-
-      if (!voteState.maps.includes(map)) {
-        await interaction.reply({ content: "Invalid map choice.", ephemeral: true });
-        return;
-      }
-
-      voteState.votedUsers.add(interaction.user.id);
-      voteState.votes[map] = (voteState.votes[map] ?? 0) + 1;
-      try {
-        const voteChannel = await getChannel(voteState.channelId);
-        if (voteChannel) {
-          const voteMessage = await voteChannel.messages.fetch(voteState.voteMessageId);
-          await voteMessage.edit({
-            embeds: [buildMapVoteEmbed(matchId, voteState.maps, voteState.votes)],
-            components: buildMapVoteRows(matchId, voteState.maps, false)
-          });
-        }
-      } catch (error) {
-        console.error("failed to update live vote counts", error);
-      }
-      await interaction.reply({ content: `Vote recorded for **${map}**`, ephemeral: true });
-      return;
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith("dailymap:")) {
-      const [, date, map] = interaction.customId.split(":");
-      const state = dailyMapVoteState;
-      if (!state || state.date !== date) {
-        await interaction.reply({ content: "Daily map voting is closed.", ephemeral: true });
-        return;
-      }
-      if (interaction.channelId !== state.channelId) {
-        await interaction.reply({ content: "Vote in the #map-vote channel.", ephemeral: true });
-        return;
-      }
-      if (state.votedUsers.has(interaction.user.id)) {
-        await interaction.reply({ content: "You already voted for today's pool.", ephemeral: true });
-        return;
-      }
-      if (!(map in state.votes)) {
-        await interaction.reply({ content: "Invalid map choice.", ephemeral: true });
-        return;
-      }
-
-      state.votedUsers.add(interaction.user.id);
-      state.votes[map] += 1;
-      await interaction.reply({ content: `Daily vote recorded for **${map}**`, ephemeral: true });
-      return;
-    }
-  } catch (error: any) {
-    if (interaction.isRepliable()) {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: `Interaction failed: ${error.message}`, ephemeral: true });
-      } else {
-        await interaction.reply({ content: `Interaction failed: ${error.message}`, ephemeral: true });
-      }
-    }
-  }
+  setInterval(async () => {
+    await upsertPanel("queue", { embed: await buildQueuePanelEmbed(), components: queuePanelButtons() }).catch(() => undefined);
+  }, 20_000);
 });
 
 client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  await handleCommand(message);
+  if (!managedPanelChannels.some((key) => channelIds[key] && message.channelId === channelIds[key])) return;
+
+  const key = managedPanelChannels.find((k) => channelIds[k] === message.channelId) as PanelKey | undefined;
+  if (!key) return;
+
+  const keep = panelMessageIds.get(key);
+  if (keep && message.id === keep) return;
+  await safeDeleteMessage(message);
+});
+client.on("interactionCreate", async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "verify") {
+        await handleVerifyCommand(interaction);
+        return;
+      }
+      if (interaction.commandName === "username") {
+        await handleUsernameCreate(interaction);
+        return;
+      }
+      if (interaction.commandName === "username-change") {
+        await handleUsernameChange(interaction);
+        return;
+      }
+      if (interaction.commandName === "tag") {
+        await handleTagChange(interaction);
+        return;
+      }
+      if (interaction.commandName === "queue") {
+        await handleQueueCommand(interaction);
+        return;
+      }
+      if (interaction.commandName === "clan") {
+        await handleClanCommand(interaction);
+        return;
+      }
+      if (interaction.commandName === "skins") {
+        await handleSkinsCommand(interaction);
+        return;
+      }
+      if (interaction.commandName === "matchend") {
+        await handleMatchEndCommand(interaction);
+        return;
+      }
+      if (interaction.commandName === "testmatch") {
+        await handleTestMatchCommand(interaction);
+        return;
+      }
+    }
+
+    if (interaction.isButton()) {
+      if (interaction.customId === "verify_now") {
+        const { nonce, question } = createCaptcha(interaction.user.id);
+        await interaction.showModal(buildVerifyCaptchaModal(`verify_captcha:${nonce}`, question));
+        return;
+      }
+
+      if (interaction.customId === "verify_check") {
+        const status = await getVerificationStatus(interaction.user.id);
+        if (!status?.verified) {
+          await interaction.reply({ content: "Verification not complete yet.", ephemeral: true });
+          return;
+        }
+        await updateVerificationRoles(interaction.user.id, status);
+        if (!status.username) {
+          await interaction.reply({ content: "Steam linked. Set username via /username <name>.", ephemeral: true });
+          return;
+        }
+        await interaction.reply({ content: `Verification complete: ${status.display_name ?? status.username}`, ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId.startsWith("queue_join_")) {
+        const mode = interaction.customId.replace("queue_join_", "");
+        const steamId = await resolveSteamIdForDiscord(interaction.user.id);
+        if (!steamId) {
+          await interaction.reply({ content: "Complete verification first.", ephemeral: true });
+          return;
+        }
+
+        const result = await userApi("/internal/queue/join", interaction.user.id, {
+          method: "POST",
+          body: JSON.stringify({ steam_id: steamId, mode, region: defaultRegion })
+        });
+
+        await upsertPanel("queue", { embed: await buildQueuePanelEmbed(), components: queuePanelButtons() });
+        await interaction.reply({ content: `Joined ${mode} queue. Size: ${result.size ?? 0}`, ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId === "queue_leave") {
+        const steamId = await resolveSteamIdForDiscord(interaction.user.id);
+        if (!steamId) {
+          await interaction.reply({ content: "Complete verification first.", ephemeral: true });
+          return;
+        }
+
+        for (const mode of ["ranked", "wingman", "casual", "clanwars"]) {
+          await userApi("/internal/queue/leave", interaction.user.id, {
+            method: "POST",
+            body: JSON.stringify({ steam_id: steamId, mode })
+          }).catch(() => undefined);
+        }
+
+        await upsertPanel("queue", { embed: await buildQueuePanelEmbed(), components: queuePanelButtons() });
+        await interaction.reply({ content: "Left queue.", ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId === "mapvote_refresh") {
+        await upsertPanel("mapVote", { embed: await buildMapVotePanelEmbed(), components: mapVotePanelButtons() });
+        await interaction.reply({ content: "Map pool refreshed.", ephemeral: true });
+      }
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("verify_captcha:")) {
+      const nonce = interaction.customId.split(":")[1] ?? "";
+      const state = captchaState.get(interaction.user.id);
+      if (!state || state.nonce !== nonce || state.expiresAt < Date.now()) {
+        await interaction.reply({ content: "Captcha expired. Click Verify Now again.", ephemeral: true });
+        return;
+      }
+
+      const answer = interaction.fields.getTextInputValue("captcha_answer").trim();
+      if (answer !== state.answer) {
+        await interaction.reply({ content: "Captcha failed. Try again.", ephemeral: true });
+        return;
+      }
+
+      captchaState.delete(interaction.user.id);
+      const verifyUrl = await startVerificationFlow(interaction.user.id);
+      await interaction.reply({
+        embeds: [new EmbedBuilder().setTitle("Captcha successful").setDescription("Now link your Steam account, then click Check Verification.")],
+        components: [
+          new ActionRowBuilder<ButtonBuilder>().addComponents(
+            new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel("Connect Steam").setURL(verifyUrl),
+            new ButtonBuilder().setCustomId("verify_check").setLabel("Check Verification").setStyle(ButtonStyle.Primary)
+          )
+        ],
+        ephemeral: true
+      });
+    }
+  } catch (error: any) {
+    const errorMessage = `Action failed: ${error?.message ?? "unknown error"}`;
+    if (interaction.isRepliable()) {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp({ content: errorMessage, ephemeral: true }).catch(() => undefined);
+      } else {
+        await interaction.reply({ content: errorMessage, ephemeral: true }).catch(() => undefined);
+      }
+    }
+  }
 });
 
 (async () => {
-  await sub.subscribe("match-events", "overwatch-events");
+  await sub.subscribe("match-events", "overwatch-events", "queue-events", "moderation-events", "security-events");
   sub.on("message", async (channel, payload) => {
-    const event = JSON.parse(payload);
-
     try {
-      if (channel === "match-events" && event.type === "match_started") {
-        await postMatchStarted(event);
-      }
-      if (channel === "match-events" && event.type === "match_found") {
-        await createMatchVoteChannel(event);
-      }
-      if (channel === "match-events" && event.type === "match_finished") {
-        await postMatchFinished(event);
-      }
-      if (channel === "overwatch-events" && event.type === "case_created") {
-        await postCaseCreated(event);
-      }
-      if (channel === "overwatch-events" && event.type === "cheat_alert") {
-        await postCheatAlert(event);
-      }
+      const event = JSON.parse(payload);
+      await handlePubsubEvent(channel, event);
     } catch (error) {
-      console.error("event handling failed", error);
+      console.error("pubsub handling failed", error);
     }
   });
 
