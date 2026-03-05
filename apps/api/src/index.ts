@@ -5501,8 +5501,6 @@ async function buildServer() {
       region: z.string().min(2).max(16).default("eu")
     })
     .parse(request.body ?? {});
-  const verified = await assertVerifiedDiscordSteam(request, reply, body.reporter_steam_id);
-  if (!verified) return;
 
   const players: Array<{ player_id: string; steam_id: string; elo: number; region: string; timestamp: string }> = [];
   for (let i = 0; i < body.count; i += 1) {

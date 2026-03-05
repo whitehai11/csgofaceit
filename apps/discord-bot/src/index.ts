@@ -5,10 +5,12 @@ import {
   Client,
   EmbedBuilder,
   IntentsBitField,
+  PermissionFlagsBits,
   StringSelectMenuBuilder,
   TextChannel,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
+  type Message,
   type StringSelectMenuInteraction
 } from "discord.js";
 import crypto from "node:crypto";
@@ -487,19 +489,19 @@ async function createMatchVoteChannel(event: any): Promise<void> {
     permissionOverwrites: [
       {
         id: guild.roles.everyone.id,
-        deny: ["ViewChannel"]
+        deny: [PermissionFlagsBits.ViewChannel]
       },
       ...(moderatorRoleId
         ? [
             {
               id: moderatorRoleId,
-              allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"]
+              allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
             }
           ]
         : []),
       ...allowedDiscordUsers.map((discordUserId) => ({
         id: discordUserId,
-        allow: ["ViewChannel", "SendMessages", "ReadMessageHistory"]
+        allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory]
       }))
     ],
     reason: `Temporary vote channel for match ${matchId}`

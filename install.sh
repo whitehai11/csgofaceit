@@ -31,6 +31,37 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+ensure_node_20() {
+  local current_major=0
+  if have_cmd node; then
+    current_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  fi
+
+  if [[ "${current_major}" -ge 20 ]]; then
+    return 0
+  fi
+
+  info "Node.js >=20 is required. Installing/upgrading Node.js 20 LTS..."
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+  chmod a+r /etc/apt/keyrings/nodesource.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+    > /etc/apt/sources.list.d/nodesource.list
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+
+  local installed_major
+  installed_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  if [[ "${installed_major}" -lt 20 ]]; then
+    error "Node.js upgrade failed. Detected version: $(node -v 2>/dev/null || echo 'unknown')"
+    exit 1
+  fi
+  success "Node.js upgraded to $(node -v)."
+}
+
 load_env_file() {
   local file="$1"
   [[ -f "$file" ]] || return 0
@@ -88,6 +119,7 @@ install_packages_if_missing() {
 
   systemctl enable docker >/dev/null 2>&1 || true
   systemctl start docker >/dev/null 2>&1 || true
+  ensure_node_20
 }
 
 upsert_env_var() {
