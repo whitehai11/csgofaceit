@@ -94,11 +94,23 @@ upsert_env_var() {
   local file="$1"
   local key="$2"
   local value="$3"
-  if grep -qE "^${key}=" "$file"; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
-  else
-    echo "${key}=${value}" >> "$file"
-  fi
+  local tmp_file
+  tmp_file="$(mktemp)"
+  awk -v k="$key" -v v="$value" '
+    BEGIN { updated = 0 }
+    index($0, k "=") == 1 {
+      print k "=" v
+      updated = 1
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print k "=" v
+      }
+    }
+  ' "$file" > "$tmp_file"
+  mv "$tmp_file" "$file"
 }
 
 prompt_secret() {
