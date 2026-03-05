@@ -1,0 +1,154 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: csgofaceit-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-csgofaceit}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./packages/db/migrations:/docker-entrypoint-initdb.d
+    restart: always
+
+  redis:
+    image: redis:7-alpine
+    container_name: csgofaceit-redis
+    volumes:
+      - redis_data:/data
+    restart: always
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: csgofaceit-api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-csgofaceit}
+      REDIS_URL: redis://redis:6379
+      API_PORT: 3001
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-change-me-internal-token}
+      INTERNAL_WEBHOOK_SECRET: ${INTERNAL_WEBHOOK_SECRET:-change-me-internal-webhook-secret}
+      SERVER_MANAGER_API_TOKEN: ${SERVER_MANAGER_API_TOKEN:-change-me-server-manager-token}
+      INTERNAL_ALLOWED_IPS: ${INTERNAL_ALLOWED_IPS:-}
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./logs:/logs
+    restart: always
+
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: csgofaceit-proxy
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: always
+
+  matchmaker:
+    build:
+      context: .
+      dockerfile: apps/matchmaker/Dockerfile
+    container_name: csgofaceit-matchmaker
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      API_BASE_URL: http://api:3001
+      SERVER_MANAGER_BASE_URL: http://server-manager:3003
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-change-me-internal-token}
+    depends_on:
+      - api
+      - redis
+      - server-manager
+    volumes:
+      - ./logs:/logs
+    restart: always
+
+  server-manager:
+    build:
+      context: .
+      dockerfile: apps/server-manager/Dockerfile
+    container_name: csgofaceit-server-manager
+    env_file:
+      - .env
+    environment:
+      SERVER_MANAGER_PORT: 3003
+      SERVER_MANAGER_API_TOKEN: ${SERVER_MANAGER_API_TOKEN:-change-me-server-manager-token}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-change-me-internal-token}
+      API_BASE_URL: http://api:3001
+      REDIS_URL: redis://redis:6379
+      CSGO_IMAGE: ${CSGO_IMAGE:-cm2network/csgo}
+      CSGO_START_PORT: ${CSGO_START_PORT:-27015}
+      CSGO_RCON_PASSWORD: ${CSGO_RCON_PASSWORD:-changeme-rcon}
+      SERVER_PUBLIC_IP: ${SERVER_PUBLIC_IP:-127.0.0.1}
+      SERVER_MANAGER_ALLOWED_IPS: ${SERVER_MANAGER_ALLOWED_IPS:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/logs
+    restart: always
+
+  discord-bot:
+    build:
+      context: .
+      dockerfile: apps/discord-bot/Dockerfile
+    container_name: csgofaceit-discord-bot
+    env_file:
+      - .env
+    environment:
+      API_BASE_URL: http://api:3001
+      PUBLIC_API_URL: http://localhost:8080
+      SERVER_MANAGER_BASE_URL: http://server-manager:3003
+      REDIS_URL: redis://redis:6379
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-change-me-internal-token}
+      INTERNAL_WEBHOOK_SECRET: ${INTERNAL_WEBHOOK_SECRET:-change-me-internal-webhook-secret}
+      SERVER_MANAGER_API_TOKEN: ${SERVER_MANAGER_API_TOKEN:-change-me-server-manager-token}
+    depends_on:
+      - api
+      - redis
+    volumes:
+      - ./logs:/logs
+    restart: always
+
+  watchdog:
+    build:
+      context: .
+      dockerfile: apps/watchdog/Dockerfile
+    container_name: csgofaceit-watchdog
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-csgofaceit}
+      REDIS_URL: redis://redis:6379
+      API_BASE_URL: http://api:3001
+      SERVER_MANAGER_BASE_URL: http://server-manager:3003
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-change-me-internal-token}
+      SERVER_MANAGER_API_TOKEN: ${SERVER_MANAGER_API_TOKEN:-change-me-server-manager-token}
+      API_HEALTH_URL: http://api:3001/health
+      DISCORD_BOT_HEALTH_URL: http://discord-bot:3004/health
+      MATCHMAKER_HEALTH_URL: http://matchmaker:3002/health
+      SERVER_MANAGER_HEALTH_URL: http://server-manager:3003/health
+      WATCHDOG_PORT: 3005
+    depends_on:
+      - api
+      - discord-bot
+      - matchmaker
+      - server-manager
+      - postgres
+      - redis
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/logs
+    restart: always
+
+volumes:
+  postgres_data:
+    name: fraghub_postgres_data
+  redis_data:
+    name: fraghub_redis_data

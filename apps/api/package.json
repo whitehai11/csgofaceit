@@ -1,0 +1,32 @@
+{
+  "name": "@csgofaceit/api",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "npx tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "npx tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@csgofaceit/auth": "0.1.0",
+    "@csgofaceit/db": "0.1.0",
+    "@csgofaceit/elo": "0.1.0",
+    "@csgofaceit/logger": "0.1.0",
+    "@csgofaceit/shared": "0.1.0",
+    "@fastify/cors": "^10.0.1",
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/rate-limit": "^10.3.0",
+    "fastify": "^5.1.0",
+    "ioredis": "^5.4.1",
+    "openid": "^2.0.10",
+    "undici": "^7.13.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/openid": "^2.0.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}

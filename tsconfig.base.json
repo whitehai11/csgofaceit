@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@csgofaceit/shared": ["packages/shared/src"],
+      "@csgofaceit/db": ["packages/db/src"],
+      "@csgofaceit/auth": ["packages/auth/src"],
+      "@csgofaceit/elo": ["packages/elo/src"],
+      "@csgofaceit/logger": ["packages/logger/src"]
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@csgofaceit/watchdog",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "npx tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "npx tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@csgofaceit/db": "0.1.0",
+    "@csgofaceit/logger": "0.1.0",
+    "dockerode": "^4.0.5",
+    "ioredis": "^5.8.1"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^3.3.37",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}
+

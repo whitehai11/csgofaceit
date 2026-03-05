@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS daily_map_pool (
+  date DATE PRIMARY KEY,
+  maps TEXT[] NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

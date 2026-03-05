@@ -1,0 +1,17 @@
+node_modules
+.env
+.env.*
+.next
+dist
+coverage
+*.log
+logs/
+SECURITY.md
+*.tsbuildinfo
+.idea/
+.vscode/
+.DS_Store
+*.pem
+*.key
+*.crt
+*.pfx  
