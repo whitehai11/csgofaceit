@@ -852,6 +852,13 @@ client.on("messageCreate", async (message) => {
   const key = managedPanelChannels.find((k) => channelIds[k] === message.channelId) as PanelKey | undefined;
   if (!key) return;
 
+  // Never delete bot/system messages in managed channels.
+  if (message.author.bot || message.system) return;
+
+  // Preserve the managed panel message even if in-memory cache is empty after restart.
+  const marker = message.embeds[0]?.footer?.text;
+  if (parsePanelKey(marker) === key) return;
+
   const keep = panelMessageIds.get(key);
   if (keep && message.id === keep) return;
   await safeDeleteMessage(message);
