@@ -32,6 +32,7 @@ const apiBaseUrl = process.env.API_BASE_URL ?? "http://api:3001";
 const serverManagerBaseUrl = process.env.SERVER_MANAGER_BASE_URL ?? "http://server-manager:3003";
 const guildId = process.env.DISCORD_GUILD_ID ?? "";
 const botApiToken = process.env.DISCORD_BOT_API_TOKEN ?? "";
+const internalApiToken = process.env.INTERNAL_API_TOKEN ?? process.env.DISCORD_BOT_API_TOKEN ?? "";
 const defaultRegion = process.env.DISCORD_DEFAULT_REGION ?? "eu";
 const enableTestMode = (process.env.DISCORD_ENABLE_TEST_MODE ?? "false").toLowerCase() === "true";
 const moderatorRoleId = process.env.DISCORD_MODERATOR_ROLE_ID ?? "";
@@ -122,6 +123,7 @@ async function botApi(path: string, init?: RequestInit): Promise<any> {
     ...init,
     headers: {
       "x-bot-token": botApiToken,
+      "x-internal-token": internalApiToken,
       ...(init?.headers ?? {})
     }
   });
@@ -132,6 +134,7 @@ async function userApi(path: string, discordId: string, init?: RequestInit): Pro
     ...init,
     headers: {
       "x-bot-token": botApiToken,
+      "x-internal-token": internalApiToken,
       "x-discord-user-id": discordId,
       ...(init?.headers ?? {})
     }
