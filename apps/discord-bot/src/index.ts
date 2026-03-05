@@ -608,7 +608,15 @@ async function handleMatchEndCommand(interaction: ChatInputCommandInteraction): 
 }
 
 async function handleTestMatchCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.reply({ content: "Use existing /testmatch flow from matchmaker integration.", ephemeral: true });
+  const mode = (interaction.options.getString("mode") ?? "ranked") as "ranked" | "clanwars";
+  const result = await botApi("/internal/test/match-bots", {
+    method: "POST",
+    body: JSON.stringify({ mode, region: defaultRegion })
+  });
+  await interaction.reply({
+    content: `Bot testmatch queued: mode=${mode}, players=${result.queued_players ?? 10}, queue=${result.queue_size ?? "?"}`,
+    ephemeral: true
+  });
 }
 
 function createCaptcha(discordId: string): { nonce: string; question: string } {
@@ -727,7 +735,20 @@ async function registerCommands(): Promise<void> {
   ];
 
   if (enableTestMode) {
-    commands.push(new SlashCommandBuilder().setName("testmatch").setDescription("Run test match flow"));
+    commands.push(
+      new SlashCommandBuilder()
+        .setName("testmatch")
+        .setDescription("Start a bot-only 5v5 test match")
+        .addStringOption((opt) =>
+          opt
+            .setName("mode")
+            .setDescription("Test mode")
+            .addChoices(
+              { name: "ranked (5v5 bots)", value: "ranked" },
+              { name: "clanwars (5v5 bots)", value: "clanwars" }
+            )
+        )
+    );
   }
 
   const clanCommand = new SlashCommandBuilder()

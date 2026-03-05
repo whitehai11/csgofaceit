@@ -5535,6 +5535,89 @@ async function buildServer() {
   return { ok: true, players };
   });
 
+  app.post("/internal/test/match-bots", async (request, reply) => {
+  if (botApiToken) {
+    const token = String(request.headers["x-bot-token"] ?? "");
+    if (token !== botApiToken) {
+      return reply.code(401).send({ error: "Unauthorized bot token" });
+    }
+  }
+
+  const body = z
+    .object({
+      mode: z.enum(["ranked", "clanwars"]).default("ranked"),
+      region: z.string().min(2).max(16).default("eu")
+    })
+    .parse(request.body ?? {});
+
+  const mode = body.mode as "ranked" | "clanwars";
+  const cfg = modeConfig[mode];
+  const entriesKey = queueEntriesKey(mode, "normal");
+  const orderKey = queueOrderKey(mode, "normal");
+  const now = Date.now();
+
+  const fakePlayers: Array<{ player_id: string; elo: number; timestamp: string }> = [];
+  for (let i = 0; i < cfg.playersPerMatch; i += 1) {
+    const steamId = `bot_${mode}_${Date.now()}_${i}_${crypto.randomBytes(2).toString("hex")}`;
+    const mmr = 900 + Math.floor(Math.random() * 500);
+    const inserted = await db.query(
+      `INSERT INTO players (steam_id, display_name, mmr, elo, player_rank)
+       VALUES ($1, $2, $3, $3, calculate_rank_from_mmr($3))
+       RETURNING id`,
+      [steamId, `BOT-${i + 1}`.padEnd(6, "0"), mmr]
+    );
+    const playerId = String(inserted.rows[0].id);
+    await db.query(
+      `INSERT INTO player_stats (player_id, wins, losses, matches_played)
+       VALUES ($1, 0, 0, 0)
+       ON CONFLICT (player_id) DO NOTHING`,
+      [playerId]
+    );
+    fakePlayers.push({
+      player_id: playerId,
+      elo: mmr,
+      timestamp: new Date(now + i).toISOString()
+    });
+  }
+
+  const multi = redis.multi();
+  for (const [index, p] of fakePlayers.entries()) {
+    const entry = {
+      player_id: p.player_id,
+      elo: p.elo,
+      mode,
+      smurf_pool: false,
+      clan_id: null,
+      clan_tag: null,
+      priority: false,
+      region: body.region,
+      timestamp: p.timestamp
+    };
+    multi.hset(entriesKey, p.player_id, JSON.stringify(entry));
+    multi.zadd(orderKey, now + index, p.player_id);
+  }
+  await multi.exec();
+
+  const size = await redis.zcard(orderKey);
+  await redis.publish(
+    "queue-events",
+    JSON.stringify({
+      type: "queue_join",
+      mode,
+      size,
+      source: "bot_testmatch",
+      players: fakePlayers.map((p) => p.player_id)
+    })
+  );
+
+  return {
+    ok: true,
+    mode,
+    queued_players: fakePlayers.length,
+    queue_size: size
+  };
+  });
+
   app.post("/queue/leave", { preHandler: [app.authenticate] }, async (request, reply) => {
   const playerId = request.user.playerId;
   const body = z.object({ mode: z.enum(queueModes).default("ranked") }).parse(request.body ?? {});
