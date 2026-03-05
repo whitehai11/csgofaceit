@@ -10,6 +10,8 @@
     "build": "npm run build --workspaces --if-present",
     "dev": "npm run dev --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
+    "assets:sync": "node scripts/sync-assets.mjs",
+    "import:game-data": "tsx scripts/import-game-data.ts",
     "lint:security": "eslint \"apps/**/*.ts\" \"packages/**/*.ts\"",
     "audit:deps": "npm audit --omit=dev",
     "audit:deps:ci": "node scripts/audit-ci.mjs",

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 140">
+  <rect width="260" height="140" fill="#111827"/>
+  <rect x="60" y="52" width="120" height="22" rx="5" fill="#9ca3af"/>
+  <rect x="94" y="74" width="28" height="36" rx="4" fill="#6b7280"/>
+  <text x="130" y="24" fill="#cbd5e1" font-size="18" text-anchor="middle" font-family="Arial">DEAGLE</text>
+</svg>

@@ -1,0 +1,26 @@
+{
+  "AK47_FIRE_SERPENT": {
+    "local": "/assets/skins/ak47_fire_serpent.svg",
+    "steam_cdn": "https://steamcdn-a.akamaihd.net/apps/730/icons/econ/default_generated/weapon_ak47_cu_fire_serpent_light_large.png",
+    "csgostash": "https://csgostash.com/img/skins/s1175.png"
+  },
+  "AK47_REDLINE": {
+    "local": "/assets/skins/ak47_redline.svg",
+    "csgostash": "https://csgostash.com/img/skins/s182.png"
+  },
+  "AK47_VULCAN": {
+    "local": "/assets/skins/ak47_vulcan.svg",
+    "csgostash": "https://csgostash.com/img/skins/s324.png"
+  },
+  "AWP_DRAGON_LORE": {
+    "local": "/assets/skins/awp_dragon_lore.svg",
+    "csgostash": "https://csgostash.com/img/skins/s48.png"
+  },
+  "M4A1_S_PRINTSTREAM": {
+    "local": "/assets/skins/m4a1s_printstream.svg",
+    "csgostash": "https://csgostash.com/img/skins/s1345.png"
+  },
+  "KNIFE_KARAMBIT_FADE": {
+    "local": "/assets/skins/knife_karambit_fade.svg"
+  }
+}

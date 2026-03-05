@@ -1,9 +1,10 @@
-# CS:GO Discord Matchmaking (Discord-Only)
+# CS:GO Matchmaking Platform (Discord + Web)
 
-Discord-first CS:GO community matchmaking stack with automated match flow, server spawning, moderation, and anti-cheat analysis.
+CS:GO community matchmaking stack with Discord automation, web platform, server orchestration, moderation, and anti-cheat analysis.
 
 ## Services
 - `apps/api` Fastify API (auth, queue, matches, reports, moderation, anti-cheat, rewards)
+- `apps/web` Next.js 14 web platform (landing, dashboard, match, leaderboard, clans, admin)
 - `apps/discord-bot` Discord bot (queue UX, streamer lobbies, map veto, moderation actions)
 - `apps/matchmaker` Redis queue consumer and match creator
 - `apps/server-manager` Docker-based CS server lifecycle manager
@@ -11,9 +12,48 @@ Discord-first CS:GO community matchmaking stack with automated match flow, serve
 - `postgres` persistence
 - `redis` queue/pubsub/cache
 
-## Removed
-- Web frontend has been removed (`apps/frontend` deleted).
-- Docker compose no longer starts a frontend container.
+## Web Platform
+- Routes:
+  - `/`
+  - `/dashboard`
+  - `/match/[id]`
+  - `/leaderboard`
+  - `/clans`
+  - `/clan/[tag]`
+  - `/admin`
+- Realtime events:
+  - `stats:update`
+  - `queue:update`
+  - `match:update`
+  - `match:timeline`
+  - `match:mapvote`
+  - `servers:update`
+- Required env for web:
+  - `NEXT_PUBLIC_API_BASE_URL`
+  - `NEXT_PUBLIC_SOCKET_URL`
+  - `CORS_ORIGINS`
+  - `COOKIE_SECURE`, `COOKIE_SAMESITE`, `COOKIE_DOMAIN`
+
+Run web locally:
+1. `npm install`
+2. `npm run dev -w @csgofaceit/web`
+
+## Asset Pipeline
+- Local asset cache root: `apps/web/public/assets`
+  - `skins/`
+  - `maps/`
+  - `ranks/`
+  - `weapons/`
+  - `icons/`
+- Runtime loader: `apps/web/lib/assets.ts`
+  - `getSkinImage(weapon, skin)`
+  - `getMapImage(map)`
+  - `getRankIcon(rank)`
+  - local-first with external fallback (Steam CDN / CSGOStash where available)
+- Sync command:
+  - `npm run assets:sync`
+- Skin asset DB table migration:
+  - `packages/db/migrations/045_skin_assets.sql`
 
 ## Discord Bot Permissions and Scopes
 - OAuth2 scopes:

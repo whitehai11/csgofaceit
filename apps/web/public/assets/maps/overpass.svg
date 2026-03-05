@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 220">
+  <rect width="400" height="220" fill="#0b1220"/>
+  <rect x="30" y="30" width="340" height="160" fill="none" stroke="#334155" stroke-width="4"/>
+  <text x="200" y="116" fill="#94a3b8" font-size="24" text-anchor="middle" font-family="Arial">Map Asset</text>
+</svg>

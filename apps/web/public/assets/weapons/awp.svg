@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 260 140">
+  <rect width="260" height="140" fill="#111827"/>
+  <rect x="24" y="60" width="200" height="14" rx="5" fill="#94a3b8"/>
+  <rect x="120" y="48" width="50" height="10" rx="4" fill="#64748b"/>
+  <rect x="40" y="74" width="46" height="30" rx="4" fill="#475569"/>
+  <text x="130" y="24" fill="#cbd5e1" font-size="18" text-anchor="middle" font-family="Arial">AWP</text>
+</svg>

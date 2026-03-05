@@ -6,6 +6,7 @@ import Redis from "ioredis";
 import crypto from "node:crypto";
 import { RelyingParty } from "openid";
 import { z } from "zod";
+import { Server as SocketIOServer } from "socket.io";
 import authPlugin from "@csgofaceit/auth";
 import { db } from "@csgofaceit/db";
 import { MAP_POOL } from "@csgofaceit/shared";
@@ -42,6 +43,9 @@ async function buildServer() {
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
+  const cookieSecure = (process.env.COOKIE_SECURE ?? "true").toLowerCase() !== "false";
+  const cookieSameSite = (process.env.COOKIE_SAMESITE ?? "lax").toLowerCase();
+  const cookieDomain = process.env.COOKIE_DOMAIN ?? "";
 
   const requestThrottle = new Map<string, { count: number; resetAt: number }>();
   const metrics = {
@@ -71,7 +75,12 @@ async function buildServer() {
 
   const reportThreshold = Number(process.env.OVERWATCH_REPORT_THRESHOLD ?? 3);
   const reportReasons = ["cheating", "griefing", "toxic", "afk"] as const;
-  const caseVotes = ["cheating", "griefing", "clean"] as const;
+  const reportReasonsWithAlias = ["cheating", "griefing", "toxic", "afk", "abusive_chat"] as const;
+  const caseVotes = ["cheating", "griefing", "clean", "insufficient_evidence", "not_cheating"] as const;
+  const notificationKinds = ["match_found", "match_starting", "overwatch_verdict", "clan_invite", "system"] as const;
+  type NotificationKind = (typeof notificationKinds)[number];
+  const overwatchConsensusRequired = Number(process.env.OVERWATCH_CONSENSUS_REQUIRED ?? 3);
+  const overwatchConsensusMaxVotes = Number(process.env.OVERWATCH_CONSENSUS_MAX_VOTES ?? 5);
   const creatorStatuses = ["pending", "approved", "rejected"] as const;
   const queueModes = ["ranked", "wingman", "casual", "superpower", "gungame", "zombie", "clanwars"] as const;
   type QueueMode = (typeof queueModes)[number];
@@ -149,6 +158,7 @@ async function buildServer() {
   const creatorMatchBonusDropChance = Number(process.env.CREATOR_MATCH_BONUS_DROP_CHANCE ?? 0.25);
   const creatorBoxBaseDropChance = Number(process.env.CREATOR_BOX_BASE_DROP_CHANCE ?? 0);
   const seasonDurationDays = Number(process.env.SEASON_DURATION_DAYS ?? 90);
+  const seasonSoftResetFactor = Number(process.env.SEASON_SOFT_RESET_FACTOR ?? 0.75);
   const seasonWeekendXpBoostMultiplier = Number(process.env.SEASON_WEEKEND_XP_BOOST_MULTIPLIER ?? 1.5);
   const premiumBattlepassTokenDropChance = Number(process.env.PREMIUM_BATTLEPASS_TOKEN_DROP_CHANCE ?? 0.005);
   const internalAllowedIps = (process.env.INTERNAL_ALLOWED_IPS ?? process.env.TRUSTED_NETWORKS ?? "")
@@ -170,6 +180,83 @@ async function buildServer() {
       .map((x) => x.trim().toLowerCase())
       .filter(Boolean)
   );
+
+  let io: SocketIOServer | null = null;
+
+  function parseCookies(rawCookie: string | undefined): Record<string, string> {
+    if (!rawCookie) return {};
+    return rawCookie
+      .split(";")
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .reduce<Record<string, string>>((acc, pair) => {
+        const idx = pair.indexOf("=");
+        if (idx <= 0) return acc;
+        const key = pair.slice(0, idx).trim();
+        const value = pair.slice(idx + 1).trim();
+        if (key) acc[key] = decodeURIComponent(value);
+        return acc;
+      }, {});
+  }
+
+  function readSessionToken(request: any): string {
+    const authHeader = String(request.headers.authorization ?? "");
+    if (authHeader.toLowerCase().startsWith("bearer ")) {
+      return authHeader.slice(7).trim();
+    }
+    const cookies = parseCookies(String(request.headers.cookie ?? ""));
+    return String(cookies.session ?? "");
+  }
+
+  async function authenticateFromHeaderOrCookie(request: any): Promise<any> {
+    const token = readSessionToken(request);
+    if (!token) throw new Error("Not authenticated");
+    return app.jwt.verify(token);
+  }
+
+  async function assertAdminUser(request: any): Promise<any> {
+    const user = await authenticateFromHeaderOrCookie(request);
+    if (!isAdminPanelRole(String(user?.role ?? "player"))) {
+      throw new Error("Admin role required");
+    }
+    return user;
+  }
+
+  function emitRealtime(event: string, payload: unknown): void {
+    if (!io) return;
+    io.emit(event, payload);
+  }
+
+  function buildSessionCookie(token: string): string {
+    const attrs = [
+      `session=${encodeURIComponent(token)}`,
+      "Path=/",
+      "HttpOnly",
+      cookieSecure ? "Secure" : "",
+      `SameSite=${cookieSameSite === "none" ? "None" : cookieSameSite === "strict" ? "Strict" : "Lax"}`,
+      "Max-Age=604800",
+      cookieDomain ? `Domain=${cookieDomain}` : ""
+    ].filter(Boolean);
+    return attrs.join("; ");
+  }
+
+  function clearSessionCookie(): string {
+    const attrs = [
+      "session=",
+      "Path=/",
+      "HttpOnly",
+      cookieSecure ? "Secure" : "",
+      `SameSite=${cookieSameSite === "none" ? "None" : cookieSameSite === "strict" ? "Strict" : "Lax"}`,
+      "Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+      cookieDomain ? `Domain=${cookieDomain}` : ""
+    ].filter(Boolean);
+    return attrs.join("; ");
+  }
+
+  function isAdminPanelRole(role: string): boolean {
+    const normalized = role.toLowerCase();
+    return normalized === "owner" || normalized === "admin" || normalized === "moderator";
+  }
 
   function assertStrongRuntimeSecret(name: string, value: string): void {
     const lowered = value.toLowerCase();
@@ -475,28 +562,57 @@ async function buildServer() {
     reply: any,
     expectedSteamId?: string
   ): Promise<{ discordId: string; steamId: string } | null> {
-    const discordId = String(request.headers["x-discord-user-id"] ?? "").trim();
-    if (!discordId) {
+    const discordIdFromHeader = String(request.headers["x-discord-user-id"] ?? "").trim();
+    if (discordIdFromHeader) {
+      const linked = await db.query(
+        "SELECT discord_id, steam_id FROM steam_links WHERE discord_id = $1",
+        [discordIdFromHeader]
+      );
+      const fallback = linked.rowCount
+        ? linked
+        : await db.query("SELECT discord_id, steam_id FROM verified_users WHERE discord_id = $1", [discordIdFromHeader]);
+      if (!fallback.rowCount) {
+        await reply.code(403).send({ error: "User is not verified" });
+        return null;
+      }
+      const steamId = String(fallback.rows[0].steam_id);
+      if (expectedSteamId && steamId !== expectedSteamId) {
+        await reply.code(403).send({ error: "Steam account does not match verified Discord account" });
+        return null;
+      }
+      return { discordId: discordIdFromHeader, steamId };
+    }
+
+    try {
+      const sessionUser = await authenticateFromHeaderOrCookie(request);
+      const sessionSteamId = String(sessionUser?.steamId ?? "").trim();
+      if (!sessionSteamId) {
+        await reply.code(401).send({ error: "Discord verification required" });
+        return null;
+      }
+      if (expectedSteamId && sessionSteamId !== expectedSteamId) {
+        await reply.code(403).send({ error: "Steam account does not match verified Discord account" });
+        return null;
+      }
+      const linked = await db.query(
+        "SELECT discord_id, steam_id FROM steam_links WHERE steam_id = $1 LIMIT 1",
+        [sessionSteamId]
+      );
+      const fallback = linked.rowCount
+        ? linked
+        : await db.query("SELECT discord_id, steam_id FROM verified_users WHERE steam_id = $1 LIMIT 1", [sessionSteamId]);
+      if (!fallback.rowCount) {
+        await reply.code(403).send({ error: "User is not verified" });
+        return null;
+      }
+      return {
+        discordId: String(fallback.rows[0].discord_id ?? ""),
+        steamId: String(fallback.rows[0].steam_id ?? sessionSteamId)
+      };
+    } catch {
       await reply.code(401).send({ error: "Discord verification required" });
       return null;
     }
-    const linked = await db.query(
-      "SELECT discord_id, steam_id FROM steam_links WHERE discord_id = $1",
-      [discordId]
-    );
-    const fallback = linked.rowCount
-      ? linked
-      : await db.query("SELECT discord_id, steam_id FROM verified_users WHERE discord_id = $1", [discordId]);
-    if (!fallback.rowCount) {
-      await reply.code(403).send({ error: "User is not verified" });
-      return null;
-    }
-    const steamId = String(fallback.rows[0].steam_id);
-    if (expectedSteamId && steamId !== expectedSteamId) {
-      await reply.code(403).send({ error: "Steam account does not match verified Discord account" });
-      return null;
-    }
-    return { discordId, steamId };
   }
 
   function normalizeUsername(input: string): string {
@@ -1795,6 +1911,18 @@ async function buildServer() {
           [playerId]
         );
         await grantSeasonReward(seasonId, playerId, steamId, `season_top10_legendary_skin`, "leaderboard", { rank });
+        await db.query(
+          `INSERT INTO battlepass_tokens (steam_id, season_id, consumed, obtained_at)
+           VALUES ($1, $2, FALSE, NOW())
+           ON CONFLICT (steam_id, season_id, consumed) DO NOTHING`,
+          [steamId, seasonId]
+        );
+        await db.query(
+          `INSERT INTO player_inventory (steam_id, item_id, rarity, item_type, season_id, obtained_at)
+           VALUES ($1, NULL, 'mythic', 'premium_battlepass_token', $2, NOW())`,
+          [steamId, seasonId]
+        );
+        await grantSeasonReward(seasonId, playerId, steamId, `season_top10_battlepass_token`, "leaderboard", { rank });
       }
       if (rank <= 3) {
         await db.query(
@@ -1813,7 +1941,7 @@ async function buildServer() {
     const players = await db.query("SELECT id, mmr FROM players");
     for (const row of players.rows) {
       const current = Number(row.mmr ?? STARTING_MMR);
-      const reset = Math.max(500, Math.round(current * 0.75));
+      const reset = Math.max(500, Math.round(current * Math.max(0.5, Math.min(0.95, seasonSoftResetFactor))));
       const rank = rankFromMmr(reset);
       await db.query(
         `UPDATE players
@@ -2276,6 +2404,38 @@ async function buildServer() {
     return true;
   }
 
+  async function assertOverwatchReviewer(request: any, reply: any): Promise<boolean> {
+    const role = String(request.user.role ?? "player").toLowerCase();
+    if (role === "owner" || role === "admin" || role === "overwatch") {
+      return true;
+    }
+    await reply.code(403).send({ error: "Forbidden" });
+    return false;
+  }
+
+  async function assertOverwatchAdmin(request: any, reply: any): Promise<boolean> {
+    const role = String(request.user.role ?? "player").toLowerCase();
+    if (role === "owner" || role === "admin") {
+      return true;
+    }
+    await reply.code(403).send({ error: "Forbidden" });
+    return false;
+  }
+
+  async function assertCreatorHost(request: any, reply: any): Promise<boolean> {
+    const role = String(request.user?.role ?? "player").toLowerCase();
+    if (role === "owner" || role === "admin" || role === "moderator") return true;
+    const playerId = String(request.user?.playerId ?? "");
+    if (!playerId) {
+      await reply.code(403).send({ error: "CREATOR_REQUIRED" });
+      return false;
+    }
+    const row = await db.query("SELECT creator_badge FROM players WHERE id = $1 LIMIT 1", [playerId]);
+    if (row.rowCount && Boolean(row.rows[0].creator_badge)) return true;
+    await reply.code(403).send({ error: "CREATOR_REQUIRED" });
+    return false;
+  }
+
   async function createBanLog(input: {
     targetPlayerId: string;
     reason: string;
@@ -2371,6 +2531,70 @@ async function buildServer() {
         error: String((error as any)?.message ?? error)
       });
     }
+  }
+
+  function toNotificationPayload(row: any) {
+    return {
+      id: String(row.id),
+      kind: String(row.kind),
+      title: String(row.title),
+      message: String(row.message),
+      metadata: row.metadata ?? {},
+      read_at: row.read_at ?? null,
+      created_at: row.created_at
+    };
+  }
+
+  async function createNotification(input: {
+    playerId: string;
+    kind: NotificationKind;
+    title: string;
+    message: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<void> {
+    try {
+      const inserted = await db.query(
+        `INSERT INTO player_notifications (player_id, kind, title, message, metadata, created_at)
+         VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+         RETURNING id, kind, title, message, metadata, read_at, created_at`,
+        [input.playerId, input.kind, input.title, input.message, JSON.stringify(input.metadata ?? {})]
+      );
+      if (inserted.rowCount) {
+        emitRealtime("notification:new", { changed: true });
+      }
+    } catch (error: any) {
+      const code = String(error?.code ?? "");
+      if (code === "42P01") {
+        // Notifications migration not applied yet.
+        return;
+      }
+      eventLogger.error("notification_create_failed", {
+        player_id: input.playerId,
+        kind: input.kind,
+        error: String(error?.message ?? error)
+      });
+    }
+  }
+
+  async function createNotificationsForMatchPlayers(input: {
+    matchId: string;
+    kind: NotificationKind;
+    title: string;
+    message: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<void> {
+    const players = await db.query("SELECT player_id FROM match_players WHERE match_id = $1", [input.matchId]);
+    await Promise.all(
+      players.rows.map((row) =>
+        createNotification({
+          playerId: String(row.player_id),
+          kind: input.kind,
+          title: input.title,
+          message: input.message,
+          metadata: input.metadata
+        })
+      )
+    );
   }
 
   async function applyPunishment(
@@ -2594,9 +2818,49 @@ async function buildServer() {
       if (corsOrigins.length === 0) return cb(null, false);
       cb(null, corsOrigins.includes(origin));
     },
-    credentials: false
+    credentials: true
   });
   await app.register(authPlugin);
+
+  app.addHook("onReady", async () => {
+    io = new SocketIOServer(app.server, {
+      cors: {
+        origin: corsOrigins.length ? corsOrigins : true,
+        credentials: true
+      }
+    });
+    const sub = redis.duplicate();
+    await sub.subscribe("queue-events", "match-events", "overwatch-events", "security-events");
+    sub.on("message", (channel, raw) => {
+      try {
+        const payload = JSON.parse(raw);
+        if (channel === "queue-events") {
+          emitRealtime("queue:update", payload);
+          emitRealtime("stats:update", { trigger: "queue" });
+          return;
+        }
+        if (channel === "match-events") {
+          emitRealtime("match:update", payload);
+          if (payload?.type === "match_state" || payload?.type === "round_update") {
+            emitRealtime("match:timeline", payload);
+          }
+          return;
+        }
+        if (channel === "overwatch-events") {
+          emitRealtime("servers:update", payload);
+          return;
+        }
+        if (channel === "security-events") {
+          emitRealtime("stats:update", { trigger: "security", payload });
+        }
+      } catch {
+        // ignore malformed pubsub payloads
+      }
+    });
+    io.on("connection", (socket) => {
+      socket.emit("stats:update", { connected: true, ts: Date.now() });
+    });
+  });
 
   app.addHook("preHandler", async (request, reply) => {
     const routePath = request.routeOptions.url;
@@ -2671,6 +2935,341 @@ async function buildServer() {
   });
 
   app.get("/health", async () => ({ status: "ok", ok: true }));
+  app.get("/stats", async () => {
+    const liveMatches = await db.query("SELECT COUNT(*)::int AS n FROM matches WHERE status = 'live'");
+    const queueCounts = await Promise.all(
+      (queueModes as readonly QueueMode[]).map(async (mode) => {
+        const normal = await redis.zcard(queueOrderKey(mode, "normal"));
+        const smurf = mode === "clanwars" ? 0 : await redis.zcard(queueOrderKey(mode, "smurf"));
+        return Number(normal) + Number(smurf);
+      })
+    );
+    const playersQueued = queueCounts.reduce((sum, value) => sum + value, 0);
+    const playersOnline = Number(await redis.scard("presence:online_users").catch(() => 0));
+
+    let serversOnline = 0;
+    try {
+      const response = await fetch(`${process.env.SERVER_MANAGER_BASE_URL ?? "http://server-manager:3003"}/servers`, {
+        headers: {
+          ...(serverManagerApiToken ? { "x-server-manager-token": serverManagerApiToken } : {}),
+          ...(internalApiToken ? { "x-internal-token": internalApiToken } : {})
+        }
+      });
+      if (response.ok) {
+        const servers = (await response.json()) as any[];
+        serversOnline = Array.isArray(servers) ? servers.filter((s) => String(s?.state ?? "") === "running").length : 0;
+      }
+    } catch {
+      serversOnline = 0;
+    }
+
+    const payload = {
+      live_matches: Number(liveMatches.rows[0]?.n ?? 0),
+      servers_online: serversOnline,
+      players_online: playersOnline,
+      players_queued: playersQueued,
+      queue_by_mode: Object.fromEntries((queueModes as readonly QueueMode[]).map((mode, i) => [mode, queueCounts[i]]))
+    };
+    emitRealtime("stats:update", payload);
+    return payload;
+  });
+
+  app.get("/servers/status", async (request, reply) => {
+    const query = z.object({ limit: z.coerce.number().int().min(1).max(200).default(100) }).parse(request.query ?? {});
+    const defaultRegion = process.env.DEFAULT_SERVER_REGION ?? "Frankfurt";
+
+    try {
+      const [serverResponse, playersByServer] = await Promise.all([
+        fetch(`${process.env.SERVER_MANAGER_BASE_URL ?? "http://server-manager:3003"}/servers`, {
+          headers: {
+            ...(serverManagerApiToken ? { "x-server-manager-token": serverManagerApiToken } : {}),
+            ...(internalApiToken ? { "x-internal-token": internalApiToken } : {})
+          }
+        }),
+        db.query(
+          `SELECT m.server_id, COUNT(mp.player_id)::int AS players
+           FROM matches m
+           LEFT JOIN match_players mp ON mp.match_id = m.id
+           WHERE m.status = 'live'
+             AND m.server_id IS NOT NULL
+           GROUP BY m.server_id`
+        )
+      ]);
+
+      if (!serverResponse.ok) {
+        return reply.code(502).send({ success: false, error: "SERVER_MANAGER_UNAVAILABLE" });
+      }
+
+      const rawServers = (await serverResponse.json()) as Array<{
+        server_id?: string;
+        container_name?: string | null;
+        state?: string;
+        status?: string;
+        map?: string | null;
+        mode?: string | null;
+      }>;
+
+      const countByServer = new Map<string, number>(
+        playersByServer.rows.map((row) => [String(row.server_id), Number(row.players ?? 0)])
+      );
+
+      const servers = rawServers.slice(0, query.limit).map((row, idx) => {
+        const serverId = String(row.server_id ?? "");
+        const online = String(row.state ?? "").toLowerCase() === "running";
+        return {
+          server_id: serverId,
+          name: `Server #${idx + 1}`,
+          region: defaultRegion,
+          players: countByServer.get(serverId) ?? 0,
+          status: online ? "online" : "offline",
+          state: row.state ?? "unknown",
+          map: row.map ?? null,
+          mode: row.mode ?? null
+        };
+      });
+
+      return { success: true, servers };
+    } catch {
+      return reply.code(502).send({ success: false, error: "SERVER_MANAGER_UNAVAILABLE" });
+    }
+  });
+
+  app.get("/leaderboard", async (request) => {
+    const query = z
+      .object({
+        mode: z.enum(["ranked", "wingman"]).default("ranked"),
+        region: z.string().optional(),
+        season: z.string().optional(),
+        page: z.coerce.number().int().min(1).default(1)
+      })
+      .parse(request.query ?? {});
+
+    const limit = 25;
+    const offset = (query.page - 1) * limit;
+    const modeColumn = query.mode === "wingman" ? "p.wingman_mmr" : "p.mmr";
+    const rankColumn = query.mode === "wingman" ? "p.wingman_rank" : "p.player_rank";
+    const whereSeason = query.season ? "AND sl.season_id = $1::uuid" : "";
+    const seasonParam = query.season ? [query.season, limit, offset] : [limit, offset];
+
+    const rows = await db.query(
+      `SELECT p.id,
+              p.steam_id,
+              p.display_name,
+              ${modeColumn} AS mmr,
+              ${rankColumn} AS rank,
+              COALESCE(ps.wins, 0) AS wins,
+              COALESCE(ps.losses, 0) AS losses,
+              COALESCE(ps.matches_played, 0) AS matches
+       FROM players p
+       LEFT JOIN player_stats ps ON ps.player_id = p.id
+       LEFT JOIN season_leaderboard sl ON sl.steam_id = p.steam_id
+       WHERE 1=1 ${whereSeason}
+       ORDER BY ${modeColumn} DESC NULLS LAST, COALESCE(ps.wins, 0) DESC
+       LIMIT $${query.season ? "2" : "1"} OFFSET $${query.season ? "3" : "2"}`,
+      seasonParam
+    );
+
+    return {
+      mode: query.mode,
+      region: query.region ?? null,
+      season: query.season ?? null,
+      page: query.page,
+      page_size: limit,
+      items: rows.rows.map((row, idx) => ({
+        position: offset + idx + 1,
+        player_id: row.id,
+        steam_id: row.steam_id,
+        display_name: row.display_name,
+        mmr: Number(row.mmr ?? 0),
+        rank: String(row.rank ?? rankFromMmr(Number(row.mmr ?? STARTING_MMR))),
+        rank_tier: String(row.rank ?? rankFromMmr(Number(row.mmr ?? STARTING_MMR))),
+        wins: Number(row.wins ?? 0),
+        losses: Number(row.losses ?? 0),
+        matches: Number(row.matches ?? 0),
+        winrate: Number(row.matches ?? 0) > 0 ? Number((((Number(row.wins ?? 0) / Number(row.matches ?? 0)) * 100)).toFixed(2)) : 0,
+        region: query.region ?? "global"
+      }))
+    };
+  });
+
+  app.get("/clans", async (request) => {
+    const query = z
+      .object({
+        page: z.coerce.number().int().min(1).default(1),
+        q: z.string().optional()
+      })
+      .parse(request.query ?? {});
+    const limit = 30;
+    const offset = (query.page - 1) * limit;
+    const hasQuery = Boolean(query.q?.trim());
+    const rows = await db.query(
+      `SELECT c.clan_id,
+              c.clan_name,
+              c.clan_tag,
+              c.created_at,
+              COALESCE(cr.rating, $1) AS rating,
+              COALESCE(cr.wins, 0) AS wins,
+              COALESCE(cr.losses, 0) AS losses,
+              COALESCE(cr.matches_played, 0) AS matches_played,
+              (SELECT COUNT(*)::int FROM clan_members cm WHERE cm.clan_id = c.clan_id) AS members_count
+       FROM clans c
+       LEFT JOIN clan_ratings cr ON cr.clan_id = c.clan_id
+       WHERE ($2::boolean = false OR c.clan_name ILIKE $3 OR c.clan_tag ILIKE $3)
+       ORDER BY COALESCE(cr.rating, $1) DESC, c.clan_tag ASC
+       LIMIT $4 OFFSET $5`,
+      [clanRatingStart, hasQuery, `%${query.q?.trim() ?? ""}%`, limit, offset]
+    );
+    return {
+      page: query.page,
+      page_size: limit,
+      items: rows.rows
+    };
+  });
+
+  app.get("/clans/:tag", async (request, reply) => {
+    const params = z.object({ tag: z.string().min(2).max(16) }).parse(request.params);
+    const clan = await db.query(
+      `SELECT c.clan_id, c.clan_name, c.clan_tag, c.owner_steam_id, c.created_at,
+              COALESCE(cr.rating, $2) AS rating,
+              COALESCE(cr.wins, 0) AS wins,
+              COALESCE(cr.losses, 0) AS losses,
+              COALESCE(cr.matches_played, 0) AS matches_played
+       FROM clans c
+       LEFT JOIN clan_ratings cr ON cr.clan_id = c.clan_id
+       WHERE UPPER(c.clan_tag) = UPPER($1)
+       LIMIT 1`,
+      [params.tag, clanRatingStart]
+    );
+    if (!clan.rowCount) return reply.code(404).send({ error: "Clan not found" });
+    const clanRank = await db.query(
+      `SELECT position
+       FROM (
+         SELECT
+           c.clan_id,
+           ROW_NUMBER() OVER (
+             ORDER BY COALESCE(cr.rating, $1) DESC, COALESCE(cr.wins, 0) DESC, c.clan_tag ASC
+           ) AS position
+         FROM clans c
+         LEFT JOIN clan_ratings cr ON cr.clan_id = c.clan_id
+       ) ranked
+       WHERE ranked.clan_id = $2
+       LIMIT 1`,
+      [clanRatingStart, clan.rows[0].clan_id]
+    );
+
+    const members = await db.query(
+      `SELECT cm.role, cm.created_at, p.steam_id, p.display_name, p.player_rank
+       FROM clan_members cm
+       JOIN players p ON p.steam_id = cm.steam_id
+       WHERE cm.clan_id = $1
+       ORDER BY cm.role DESC, p.display_name ASC`,
+      [clan.rows[0].clan_id]
+    );
+    const history = await db.query(
+      `SELECT cwm.match_id, cwm.created_at, cwm.clan_a_score, cwm.clan_b_score,
+              ca.clan_tag AS clan_a_tag, cb.clan_tag AS clan_b_tag, wa.clan_tag AS winner_clan_tag
+       FROM clan_war_matches cwm
+       JOIN clans ca ON ca.clan_id = cwm.clan_a_id
+       JOIN clans cb ON cb.clan_id = cwm.clan_b_id
+       LEFT JOIN clans wa ON wa.clan_id = cwm.winner_clan_id
+       WHERE cwm.clan_a_id = $1 OR cwm.clan_b_id = $1
+       ORDER BY cwm.created_at DESC
+       LIMIT 25`,
+      [clan.rows[0].clan_id]
+    );
+
+    return {
+      clan: {
+        ...clan.rows[0],
+        clan_rank: clanRank.rowCount ? Number(clanRank.rows[0].position) : null
+      },
+      members: members.rows,
+      history: history.rows
+    };
+  });
+
+  app.get("/users/:steamId/profile", async (request, reply) => {
+    const params = z.object({ steamId: z.string().min(3).max(64) }).parse(request.params);
+    const player = await db.query(
+      `SELECT p.id, p.steam_id, p.display_name, p.avatar_url, p.player_rank, p.wingman_rank,
+              p.mmr, p.wingman_mmr, p.trust_score, p.created_at, u.username
+       FROM players p
+       LEFT JOIN users u ON u.steam_id = p.steam_id
+       WHERE p.steam_id = $1
+       LIMIT 1`,
+      [params.steamId]
+    );
+    if (!player.rowCount) return reply.code(404).send({ error: "User not found" });
+    const stats = await db.query(
+      `SELECT COALESCE(wins, 0) AS wins, COALESCE(losses, 0) AS losses, COALESCE(matches_played, 0) AS matches_played
+       FROM player_stats
+       WHERE player_id = $1`,
+      [player.rows[0].id]
+    );
+    const performance = await db.query(
+      `SELECT
+         COALESCE(AVG(COALESCE((pm.metrics_json->>'kd')::numeric, 0)), 0)::float8 AS kd_ratio,
+         COALESCE(AVG(COALESCE((pm.metrics_json->>'headshot_rate')::numeric, 0)), 0)::float8 AS headshot_percentage
+       FROM player_match_metrics pm
+       WHERE pm.steam_id = $1`,
+      [params.steamId]
+    );
+    const history = await db.query(
+      `SELECT
+         m.id AS match_id,
+         m.map,
+         m.status,
+         m.winner_team,
+         COALESCE(m.team_a_score, 0) AS team_a_score,
+         COALESCE(m.team_b_score, 0) AS team_b_score,
+         mp.team,
+         m.created_at
+       FROM match_players mp
+       JOIN matches m ON m.id = mp.match_id
+       WHERE mp.player_id = $1
+       ORDER BY m.created_at DESC
+       LIMIT 10`,
+      [player.rows[0].id]
+    );
+    const matchesPlayed = Number(stats.rows[0]?.matches_played ?? 0);
+    const wins = Number(stats.rows[0]?.wins ?? 0);
+    const winrate = matchesPlayed > 0 ? (wins / matchesPlayed) * 100 : 0;
+    return {
+      player: {
+        ...player.rows[0],
+        trust_score: Number(player.rows[0].trust_score ?? 100),
+        mmr: Number(player.rows[0].mmr ?? STARTING_MMR),
+        wingman_mmr: Number(player.rows[0].wingman_mmr ?? STARTING_MMR)
+      },
+      stats: stats.rowCount
+        ? {
+            wins: Number(stats.rows[0].wins ?? 0),
+            losses: Number(stats.rows[0].losses ?? 0),
+            matches_played: Number(stats.rows[0].matches_played ?? 0)
+          }
+        : { wins: 0, losses: 0, matches_played: 0 }
+      ,
+      performance: {
+        winrate: Number(winrate.toFixed(2)),
+        kd_ratio: Number(performance.rows[0]?.kd_ratio ?? 0),
+        headshot_percentage: Number(performance.rows[0]?.headshot_percentage ?? 0)
+      },
+      match_history: history.rows.map((row) => {
+        const winner = row.winner_team ? String(row.winner_team) : "";
+        const team = row.team ? String(row.team) : "";
+        const result = winner && team && winner === team ? "Win" : "Loss";
+        return {
+          match_id: String(row.match_id),
+          result,
+          map: String(row.map ?? "Unknown"),
+          score: `${Number(row.team_a_score ?? 0)} - ${Number(row.team_b_score ?? 0)}`,
+          status: String(row.status ?? "unknown"),
+          created_at: row.created_at
+        };
+      })
+    };
+  });
+
   app.get("/internal/metrics", async () => ({
     ok: true,
     metrics,
@@ -2695,9 +3294,115 @@ async function buildServer() {
     return { ok: true, enabled: body.enabled };
   });
 
-  app.get("/auth/steam", async (_req, reply) => {
+  app.get("/auth/steam", async (request, reply) => {
   const authUrl = await createSteamAuthUrl(steamReturnUrl);
-  return reply.send({ url: authUrl });
+  const query = request.query as Record<string, string | undefined>;
+  const asJson = String(query?.json ?? "").toLowerCase() === "true";
+  if (asJson) {
+    return reply.send({ url: authUrl });
+  }
+  return reply.redirect(authUrl);
+  });
+
+  app.get("/auth/me", async (request, reply) => {
+    try {
+      const user = await authenticateFromHeaderOrCookie(request);
+      return { authenticated: true, user };
+    } catch {
+      return reply.code(401).send({ authenticated: false, error: "Not authenticated" });
+    }
+  });
+
+  app.post("/auth/logout", async (_request, reply) => {
+    reply.header("Set-Cookie", clearSessionCookie());
+    return { ok: true };
+  });
+
+  app.get("/notifications", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const query = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(100).default(20),
+        unread_only: z.coerce.boolean().optional()
+      })
+      .parse(request.query ?? {});
+    try {
+      const rows = query.unread_only
+        ? await db.query(
+            `SELECT id, kind, title, message, metadata, read_at, created_at
+             FROM player_notifications
+             WHERE player_id = $1
+               AND read_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT $2`,
+            [request.user.playerId, query.limit]
+          )
+        : await db.query(
+            `SELECT id, kind, title, message, metadata, read_at, created_at
+             FROM player_notifications
+             WHERE player_id = $1
+             ORDER BY created_at DESC
+             LIMIT $2`,
+            [request.user.playerId, query.limit]
+          );
+      const unreadCount = await db.query(
+        `SELECT COUNT(*)::int AS count
+         FROM player_notifications
+         WHERE player_id = $1
+           AND read_at IS NULL`,
+        [request.user.playerId]
+      );
+      return {
+        success: true,
+        unread_count: Number(unreadCount.rows[0]?.count ?? 0),
+        notifications: rows.rows.map((row) => toNotificationPayload(row))
+      };
+    } catch (error: any) {
+      if (String(error?.code ?? "") === "42P01") {
+        return { success: true, unread_count: 0, notifications: [] };
+      }
+      return reply.code(500).send({ success: false, error: "NOTIFICATIONS_FETCH_FAILED" });
+    }
+  });
+
+  app.post("/notifications/:id/read", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    try {
+      const updated = await db.query(
+        `UPDATE player_notifications
+         SET read_at = COALESCE(read_at, NOW())
+         WHERE id = $1
+           AND player_id = $2
+         RETURNING id, kind, title, message, metadata, read_at, created_at`,
+        [params.id, request.user.playerId]
+      );
+      if (!updated.rowCount) {
+        return reply.code(404).send({ success: false, error: "NOTIFICATION_NOT_FOUND" });
+      }
+      return { success: true, notification: toNotificationPayload(updated.rows[0]) };
+    } catch (error: any) {
+      if (String(error?.code ?? "") === "42P01") {
+        return reply.code(404).send({ success: false, error: "NOTIFICATIONS_NOT_ENABLED" });
+      }
+      return reply.code(500).send({ success: false, error: "NOTIFICATION_READ_FAILED" });
+    }
+  });
+
+  app.post("/notifications/read-all", { preHandler: [app.authenticate] }, async (request, reply) => {
+    try {
+      const updated = await db.query(
+        `UPDATE player_notifications
+         SET read_at = NOW()
+         WHERE player_id = $1
+           AND read_at IS NULL`,
+        [request.user.playerId]
+      );
+      return { success: true, updated: Number(updated.rowCount ?? 0) };
+    } catch (error: any) {
+      if (String(error?.code ?? "") === "42P01") {
+        return { success: true, updated: 0 };
+      }
+      return reply.code(500).send({ success: false, error: "NOTIFICATION_READ_ALL_FAILED" });
+    }
   });
 
   app.post("/internal/verification/start", async (request, reply) => {
@@ -3109,6 +3814,7 @@ async function buildServer() {
   }
 
   const token = app.jwt.sign({ playerId: player.id, steamId: player.steam_id, role: player.role }, { expiresIn: "7d" });
+  reply.header("Set-Cookie", buildSessionCookie(token));
   const callbackRedirect = process.env.AUTH_CALLBACK_REDIRECT_URL;
   if (callbackRedirect) {
     const safePath = normalizeSafeRelativePath("/auth/callback");
@@ -3200,6 +3906,52 @@ async function buildServer() {
   return {
     categories: grouped
   };
+  });
+
+  app.get("/assets/skins", async (request, reply) => {
+  const query = z
+    .object({
+      weapon: z.string().min(2).max(64).optional(),
+      rarity: z.string().min(3).max(32).optional(),
+      limit: z.coerce.number().int().min(1).max(500).default(200)
+    })
+    .parse(request.query ?? {});
+  try {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (query.weapon) {
+      params.push(query.weapon.toLowerCase());
+      clauses.push(`lower(weapon) = $${params.length}`);
+    }
+    if (query.rarity) {
+      params.push(query.rarity.toLowerCase());
+      clauses.push(`lower(rarity) = $${params.length}`);
+    }
+    params.push(query.limit);
+    const whereSql = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = await db.query(
+      `SELECT id, weapon, skin_name, rarity, image_url, model_path, local_path, steam_cdn_url, csgostash_url, updated_at
+       FROM skin_assets
+       ${whereSql}
+       ORDER BY weapon ASC, skin_name ASC
+       LIMIT $${params.length}`,
+      params
+    );
+    return { success: true, items: rows.rows };
+  } catch (error: any) {
+    if (String(error?.code ?? "") !== "42P01") {
+      return reply.code(500).send({ success: false, error: "ASSET_SKINS_FETCH_FAILED" });
+    }
+    const rows = await db.query(
+      `SELECT gen_random_uuid() AS id, weapon_name AS weapon, skin_name, rarity, image_url,
+              NULL::text AS model_path, NULL::text AS local_path, NULL::text AS steam_cdn_url, NULL::text AS csgostash_url, NOW() AS updated_at
+       FROM weapon_skins
+       ORDER BY weapon_name ASC, skin_name ASC
+       LIMIT $1`,
+      [query.limit]
+    );
+    return { success: true, items: rows.rows };
+  }
   });
 
   app.get("/player/skins/:steamid", async (request) => {
@@ -3452,7 +4204,7 @@ async function buildServer() {
   const season = await ensureActiveSeason();
   const query = z.object({ limit: z.coerce.number().int().min(1).max(100).default(20) }).parse(request.query ?? {});
   const rows = await db.query(
-    `SELECT sl.rank, sl.steam_id, sl.mmr, sl.wins, sl.matches, p.display_name
+    `SELECT sl.rank, sl.steam_id, sl.mmr, sl.wins, sl.matches, p.display_name, p.player_rank
      FROM season_leaderboard sl
      LEFT JOIN players p ON p.steam_id = sl.steam_id
      WHERE sl.season_id = $1
@@ -3464,6 +4216,37 @@ async function buildServer() {
     season,
     leaderboard: rows.rows
   };
+  });
+
+  app.get("/season/summary", async (request) => {
+    const season = await ensureActiveSeason();
+    const query = z.object({ limit: z.coerce.number().int().min(1).max(100).default(20) }).parse(request.query ?? {});
+    const leaderboardRows = await db.query(
+      `SELECT sl.rank, sl.steam_id, sl.mmr, sl.wins, sl.matches, p.display_name, p.player_rank
+       FROM season_leaderboard sl
+       LEFT JOIN players p ON p.steam_id = sl.steam_id
+       WHERE sl.season_id = $1
+       ORDER BY sl.rank ASC
+       LIMIT $2`,
+      [season.season_id, query.limit]
+    );
+    const totalRows = await db.query(
+      `SELECT COUNT(*)::int AS total
+       FROM season_leaderboard
+       WHERE season_id = $1`,
+      [season.season_id]
+    );
+    return {
+      season,
+      total_ranked_players: Number(totalRows.rows[0]?.total ?? 0),
+      reward_tiers: [
+        { tier: "Top 3", rewards: ["Exclusive knife skin", "Legendary season cosmetics", "Premium battle pass token"] },
+        { tier: "Top 10", rewards: ["Legendary skin", "Premium battle pass token"] },
+        { tier: "Top 50", rewards: ["Epic skin"] },
+        { tier: "Top 100", rewards: ["Season badge"] }
+      ],
+      leaderboard: leaderboardRows.rows
+    };
   });
 
   app.get("/internal/season/status/:steamid", async (request, reply) => {
@@ -4256,10 +5039,58 @@ async function buildServer() {
     [playerId]
   );
 
+  const metrics = await db.query(
+    `SELECT
+       COALESCE(AVG(COALESCE((pm.metrics_json->>'kd')::numeric, 0)), 0)::float8 AS avg_kd
+     FROM player_match_metrics pm
+     WHERE pm.steam_id = $1`,
+    [params.steamid]
+  );
+
+  const recentMatches = await db.query(
+    `SELECT
+       m.id AS match_id,
+       m.winner_team,
+       mp.team
+     FROM match_players mp
+     JOIN matches m ON m.id = mp.match_id
+     WHERE mp.player_id = $1
+       AND m.status = 'finished'
+     ORDER BY m.updated_at DESC NULLS LAST, m.created_at DESC NULLS LAST
+     LIMIT 5`,
+    [playerId]
+  );
+
+  const clutchWins = await db.query(
+    `SELECT COUNT(*)::int AS clutch_wins
+     FROM match_highlights mh
+     WHERE mh.player_id = $1
+       AND mh.event_type = 'clutch_1v3'`,
+    [playerId]
+  );
+
+  const matchesPlayed = Number(stats.rows[0]?.matches_played ?? 0);
+  const wins = Number(stats.rows[0]?.wins ?? 0);
+  const avgKd = Number(metrics.rows[0]?.avg_kd ?? 0);
+  const winRate = matchesPlayed > 0 ? (wins / matchesPlayed) * 100 : 0;
+  const clutchRate = matchesPlayed > 0 ? (Number(clutchWins.rows[0]?.clutch_wins ?? 0) / matchesPlayed) * 100 : 0;
+  const recentResults = recentMatches.rows.map((row) => {
+    const winner = row.winner_team ? String(row.winner_team) : "";
+    const team = row.team ? String(row.team) : "";
+    if (!winner || !team) return "Loss";
+    return winner === team ? "Win" : "Loss";
+  });
+
   return {
     player: player.rows[0],
     stats: stats.rows[0] ?? { wins: 0, losses: 0, matches_played: 0 },
-    skins: skins.rows
+    skins: skins.rows,
+    performance: {
+      win_rate: Number(winRate.toFixed(2)),
+      kd_ratio: Number(avgKd.toFixed(2)),
+      clutch_win_rate: Number(clutchRate.toFixed(2))
+    },
+    recent_matches: recentResults
   };
   });
 
@@ -4720,6 +5551,20 @@ async function buildServer() {
     [clan.clan_id, verified.steamId, targetSteamId]
   );
   await refreshPlayerDisplayName(targetSteamId);
+  const targetPlayer = await db.query("SELECT id FROM players WHERE steam_id = $1 LIMIT 1", [targetSteamId]);
+  if (targetPlayer.rowCount) {
+    await createNotification({
+      playerId: String(targetPlayer.rows[0].id),
+      kind: "clan_invite",
+      title: "Clan invite",
+      message: `You joined [${String(clan.clan_tag)}] ${String(clan.clan_name)}.`,
+      metadata: {
+        clan_id: String(clan.clan_id),
+        clan_name: String(clan.clan_name),
+        clan_tag: String(clan.clan_tag)
+      }
+    });
+  }
   const targetDiscord = await db.query("SELECT discord_id FROM steam_links WHERE steam_id = $1 LIMIT 1", [targetSteamId]);
   return {
     ok: true,
@@ -5413,9 +6258,11 @@ async function buildServer() {
       reporter_steam_id: z.string().min(3).max(64),
       reported_steam_id: z.string().min(3).max(64),
       match_id: z.string().uuid(),
-      reason: z.enum(reportReasons)
+      reason: z.enum(reportReasonsWithAlias),
+      comment: z.string().max(1000).optional()
     })
     .parse(request.body);
+  const normalizedReason = body.reason === "abusive_chat" ? "toxic" : body.reason;
   if (
     !(await enforceAccountRateLimit({
       route: "/internal/report",
@@ -5456,15 +6303,15 @@ async function buildServer() {
   }
 
   await db.query(
-    `INSERT INTO reports (match_id, reporter_id, reported_player_id, reason)
-     VALUES ($1, $2, $3, $4)`,
-    [body.match_id, reporter.rows[0].id, reported.rows[0].id, body.reason]
+    `INSERT INTO reports (match_id, reporter_id, reported_player_id, reason, comment)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [body.match_id, reporter.rows[0].id, reported.rows[0].id, normalizedReason, body.comment ?? null]
   );
   await createModerationLog({
     action: "report",
     playerId: String(reported.rows[0].id),
     moderatorId: String(reporter.rows[0].id),
-    reason: body.reason,
+    reason: [normalizedReason, body.comment].filter(Boolean).join(" | "),
     matchId: body.match_id
   });
   const update = await db.query(
@@ -5478,7 +6325,7 @@ async function buildServer() {
     reporter_id: reporter.rows[0].id,
     reported_player_id: reported.rows[0].id,
     match_id: body.match_id,
-    reason: body.reason,
+    reason: normalizedReason,
     report_score: Number(update.rows[0]?.report_score ?? 0),
     source: "discord_bot"
   });
@@ -5652,10 +6499,44 @@ async function buildServer() {
   });
 
   app.get("/queue/status", async (request) => {
-  const query = z.object({ mode: z.enum(queueModes).default("ranked") }).parse(request.query ?? {});
+  const query = z.object({ mode: z.enum(queueModes).optional() }).parse(request.query ?? {});
+  const averageRankForMode = async (mode: QueueMode): Promise<string> => {
+    const [normalEntriesRaw, smurfEntriesRaw] = await Promise.all([
+      redis.hvals(queueEntriesKey(mode)).catch(() => [] as string[]),
+      redis.hvals(queueEntriesKey(mode, "smurf")).catch(() => [] as string[])
+    ]);
+    const entries = [...normalEntriesRaw, ...smurfEntriesRaw]
+      .map((raw) => {
+        try {
+          return JSON.parse(String(raw)) as { elo?: number; mmr?: number };
+        } catch {
+          return { elo: undefined, mmr: undefined };
+        }
+      })
+      .map((entry) => Number(entry.elo ?? entry.mmr ?? STARTING_MMR))
+      .filter((value) => Number.isFinite(value));
+
+    if (!entries.length) {
+      return rankFromMmr(STARTING_MMR);
+    }
+    const avg = entries.reduce((sum, value) => sum + value, 0) / entries.length;
+    return rankFromMmr(avg);
+  };
+
+  if (!query.mode) {
+    const counts = await Promise.all(
+      (queueModes as readonly QueueMode[]).map(async (mode) => {
+        const size = (await redis.zcard(queueOrderKey(mode))) + (await redis.zcard(queueOrderKey(mode, "smurf")));
+        const average_rank = await averageRankForMode(mode);
+        return [mode, { size, needed: Math.max(0, modeConfig[mode].playersPerMatch - size), average_rank }] as const;
+      })
+    );
+    return { modes: Object.fromEntries(counts) };
+  }
   const mode = query.mode as QueueMode;
   const size = (await redis.zcard(queueOrderKey(mode))) + (await redis.zcard(queueOrderKey(mode, "smurf")));
-  return { mode, size, needed: Math.max(0, modeConfig[mode].playersPerMatch - size) };
+  const average_rank = await averageRankForMode(mode);
+  return { mode, size, needed: Math.max(0, modeConfig[mode].playersPerMatch - size), average_rank };
   });
 
   async function getTodayMapPool() {
@@ -5741,8 +6622,12 @@ async function buildServer() {
 
   return result.rows.map((row) => ({
     match_id: row.id,
+    server_id: row.server_id ?? null,
+    server_ip: row.server_ip ?? null,
+    server_port: row.server_port ?? null,
     map: row.map,
     map_display: prettyMapName(row.map),
+    mode: row.mode ?? "ranked",
     creator_match: Boolean(row.creator_match),
     creator_player_id: row.creator_player_id ?? null,
     creator_stream_url: row.creator_stream_url ?? null,
@@ -5776,13 +6661,49 @@ async function buildServer() {
   }
 
   const players = await db.query(
-    `SELECT mp.team, p.id, p.display_name, p.player_rank
+    `SELECT mp.team, p.id, p.steam_id, p.display_name, p.avatar_url, p.player_rank
      FROM match_players mp
      JOIN players p ON p.id = mp.player_id
      WHERE mp.match_id = $1
      ORDER BY mp.team, p.display_name`,
     [params.id]
   );
+  const metrics = await db.query(
+    `SELECT pm.steam_id,
+            COALESCE((pm.metrics_json->>'kills')::int, 0) AS kills,
+            COALESCE((pm.metrics_json->>'deaths')::int, 0) AS deaths,
+            COALESCE((pm.metrics_json->>'assists')::int, 0) AS assists,
+            COALESCE((pm.metrics_json->>'adr')::float8, 0) AS adr
+     FROM player_match_metrics pm
+     WHERE pm.match_id = $1`,
+    [params.id]
+  );
+  const metricsBySteam = new Map<string, { kills: number; deaths: number; assists: number; adr: number }>(
+    metrics.rows.map((row) => [
+      String(row.steam_id),
+      {
+        kills: Number(row.kills ?? 0),
+        deaths: Number(row.deaths ?? 0),
+        assists: Number(row.assists ?? 0),
+        adr: Number(row.adr ?? 0)
+      }
+    ])
+  );
+  const scoreboard = players.rows.map((row) => {
+    const metric = metricsBySteam.get(String(row.steam_id)) ?? { kills: 0, deaths: 0, assists: 0, adr: 0 };
+    return {
+      team: row.team,
+      player_id: row.id,
+      steam_id: row.steam_id,
+      display_name: row.display_name,
+      avatar_url: row.avatar_url ?? null,
+      player_rank: row.player_rank,
+      kills: metric.kills,
+      deaths: metric.deaths,
+      assists: metric.assists,
+      adr: Number(metric.adr.toFixed(1))
+    };
+  });
   const creator = match.rows[0].creator_player_id
     ? await db.query(
         `SELECT p.id, p.steam_id, p.display_name, sl.discord_id
@@ -5810,11 +6731,132 @@ async function buildServer() {
     creator_stream_url: match.rows[0].creator_stream_url ?? null,
     creator: creator.rowCount ? creator.rows[0] : null,
     players: players.rows,
+    scoreboard,
     connection_data: {
       server_ip: match.rows[0].server_ip,
       port: match.rows[0].server_port
     }
   };
+  });
+
+  app.post("/match/:id/ready", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const roster = await db.query(
+      `SELECT mp.player_id
+       FROM match_players mp
+       WHERE mp.match_id = $1`,
+      [params.id]
+    );
+    if (!roster.rowCount) return reply.code(404).send({ success: false, error: "MATCH_NOT_FOUND" });
+    const isParticipant = roster.rows.some((r) => String(r.player_id) === String(request.user.playerId));
+    if (!isParticipant) return reply.code(403).send({ success: false, error: "NOT_MATCH_PARTICIPANT" });
+
+    const readyKey = `match:ready:${params.id}`;
+    await redis.sadd(readyKey, request.user.playerId);
+    await redis.expire(readyKey, 60 * 60);
+    const readyCount = Number(await redis.scard(readyKey));
+    const required = roster.rowCount;
+    const payload = {
+      match_id: params.id,
+      ready_count: readyCount,
+      required,
+      all_ready: readyCount >= required
+    };
+    emitRealtime("match:update", { type: "ready", ...payload });
+    return { success: true, ...payload };
+  });
+
+  app.post("/match/:id/vote", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = z.object({ map: z.string().min(2).max(64) }).parse(request.body ?? {});
+
+    const roster = await db.query(
+      `SELECT player_id, team
+       FROM match_players
+       WHERE match_id = $1`,
+      [params.id]
+    );
+    if (!roster.rowCount) return reply.code(404).send({ success: false, error: "MATCH_NOT_FOUND" });
+    const voter = roster.rows.find((row) => String(row.player_id) === String(request.user.playerId));
+    if (!voter) return reply.code(403).send({ success: false, error: "NOT_MATCH_PARTICIPANT" });
+
+    const voteKey = `match:mapvote:${params.id}`;
+    const existingRaw = await redis.get(voteKey);
+    const parsed: {
+      maps: string[];
+      removed: Array<{ map: string; by_team: "A" | "B"; at: string }>;
+      turn: "A" | "B";
+      final_map: string | null;
+    } = existingRaw
+      ? JSON.parse(existingRaw)
+      : { maps: [...MAP_POOL], removed: [], turn: "A", final_map: null };
+
+    const team = String(voter.team) === "B" ? "B" : "A";
+    if (parsed.final_map) {
+      return reply.code(409).send({ success: false, error: "MAP_ALREADY_LOCKED", state: parsed });
+    }
+    if (team !== parsed.turn) {
+      return reply.code(409).send({ success: false, error: "NOT_YOUR_TURN", state: parsed });
+    }
+    if (!parsed.maps.includes(body.map)) {
+      return reply.code(400).send({ success: false, error: "MAP_NOT_AVAILABLE", state: parsed });
+    }
+
+    parsed.maps = parsed.maps.filter((map) => map !== body.map);
+    parsed.removed.push({ map: body.map, by_team: team, at: new Date().toISOString() });
+    parsed.turn = parsed.turn === "A" ? "B" : "A";
+    if (parsed.maps.length <= 1) {
+      parsed.final_map = parsed.maps[0] ?? null;
+      if (parsed.final_map) {
+        await db.query("UPDATE matches SET map = $2 WHERE id = $1", [params.id, parsed.final_map]);
+      }
+    }
+    await redis.set(voteKey, JSON.stringify(parsed), "EX", 60 * 60);
+
+    await db.query(
+      `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+       VALUES ($1, 'map_veto', $2::jsonb, NOW())`,
+      [
+        params.id,
+        JSON.stringify({
+          voter_player_id: request.user.playerId,
+          voter_team: team,
+          removed_map: body.map,
+          remaining_maps: parsed.maps,
+          final_map: parsed.final_map
+        })
+      ]
+    );
+
+    emitRealtime("match:mapvote", {
+      match_id: params.id,
+      removed_map: body.map,
+      state: parsed
+    });
+    if (parsed.final_map) {
+      emitRealtime("match:update", {
+        match_id: params.id,
+        type: "map_locked",
+        map: parsed.final_map
+      });
+    }
+    return { success: true, state: parsed };
+  });
+
+  app.get("/match/:id/timeline", async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const rows = await db.query(
+      `SELECT id, event_type, payload, created_at
+       FROM match_timeline_events
+       WHERE match_id = $1
+       ORDER BY created_at ASC`,
+      [params.id]
+    );
+    if (!rows.rowCount) {
+      const exists = await db.query("SELECT 1 FROM matches WHERE id = $1", [params.id]);
+      if (!exists.rowCount) return reply.code(404).send({ error: "Match not found" });
+    }
+    return { match_id: params.id, events: rows.rows };
   });
 
   app.get("/matches/:id/highlights", async (request, reply) => {
@@ -5852,6 +6894,159 @@ async function buildServer() {
     };
   });
 
+  app.get("/highlights", async (request) => {
+    const query = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(100).default(30),
+        map: z.string().min(2).max(64).optional()
+      })
+      .parse(request.query ?? {});
+
+    const rows = query.map
+      ? await db.query(
+          `SELECT
+             h.id,
+             h.match_id,
+             h.player_id,
+             h.event_type,
+             h.round_number,
+             h.timestamp_seconds,
+             h.demo_url,
+             h.clip_url,
+             h.metadata,
+             h.created_at,
+             p.display_name,
+             p.player_rank,
+             m.map
+           FROM match_highlights h
+           JOIN players p ON p.id = h.player_id
+           JOIN matches m ON m.id = h.match_id
+           WHERE m.map = $1
+           ORDER BY
+             CASE h.event_type
+               WHEN 'ace' THEN 100
+               WHEN 'clutch_1v3' THEN 80
+               WHEN '4k' THEN 70
+               WHEN 'noscope_kill' THEN 60
+               ELSE 10
+             END DESC,
+             h.created_at DESC
+           LIMIT $2`,
+          [query.map, query.limit]
+        )
+      : await db.query(
+          `SELECT
+             h.id,
+             h.match_id,
+             h.player_id,
+             h.event_type,
+             h.round_number,
+             h.timestamp_seconds,
+             h.demo_url,
+             h.clip_url,
+             h.metadata,
+             h.created_at,
+             p.display_name,
+             p.player_rank,
+             m.map
+           FROM match_highlights h
+           JOIN players p ON p.id = h.player_id
+           JOIN matches m ON m.id = h.match_id
+           ORDER BY
+             CASE h.event_type
+               WHEN 'ace' THEN 100
+               WHEN 'clutch_1v3' THEN 80
+               WHEN '4k' THEN 70
+               WHEN 'noscope_kill' THEN 60
+               ELSE 10
+             END DESC,
+             h.created_at DESC
+           LIMIT $1`,
+          [query.limit]
+        );
+
+    return rows.rows.map((row) => ({
+      id: String(row.id),
+      match_id: String(row.match_id),
+      player_id: String(row.player_id),
+      player_name: String(row.display_name ?? "Player"),
+      player_rank: String(row.player_rank ?? "Unranked"),
+      map: String(row.map ?? "unknown"),
+      event_type: String(row.event_type ?? "highlight"),
+      round_number: row.round_number === null ? null : Number(row.round_number),
+      timestamp_seconds: Number(row.timestamp_seconds ?? 0),
+      clip_url: row.clip_url ?? null,
+      demo_url: row.demo_url ?? null,
+      created_at: row.created_at
+    }));
+  });
+
+  app.post("/highlights/upload", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const body = z
+      .object({
+        match_id: z.string().uuid(),
+        event_type: z.enum(["ace", "4k", "clutch_1v3", "noscope_kill"]).default("4k"),
+        clip_url: z.string().url(),
+        round_number: z.number().int().min(1).max(60).optional(),
+        timestamp_seconds: z.number().int().min(0).optional(),
+        title: z.string().min(2).max(120).optional()
+      })
+      .parse(request.body ?? {});
+
+    const participant = await db.query(
+      `SELECT 1
+       FROM match_players
+       WHERE match_id = $1 AND player_id = $2
+       LIMIT 1`,
+      [body.match_id, request.user.playerId]
+    );
+    if (!participant.rowCount) {
+      return reply.code(403).send({ error: "NOT_MATCH_PARTICIPANT" });
+    }
+
+    const match = await db.query("SELECT demo_url FROM matches WHERE id = $1 LIMIT 1", [body.match_id]);
+    if (!match.rowCount) return reply.code(404).send({ error: "MATCH_NOT_FOUND" });
+
+    const inserted = await db.query(
+      `INSERT INTO match_highlights (match_id, player_id, event_type, round_number, timestamp_seconds, demo_url, clip_url, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+       RETURNING id, match_id, player_id, event_type, round_number, timestamp_seconds, clip_url, created_at`,
+      [
+        body.match_id,
+        request.user.playerId,
+        body.event_type,
+        body.round_number ?? null,
+        body.timestamp_seconds ?? 0,
+        match.rows[0].demo_url ?? null,
+        body.clip_url,
+        JSON.stringify({
+          source: "player_upload",
+          title: body.title ?? null
+        })
+      ]
+    );
+
+    emitRealtime("match:update", {
+      type: "highlight_uploaded",
+      match_id: body.match_id,
+      highlight_id: String(inserted.rows[0].id)
+    });
+
+    return {
+      ok: true,
+      highlight: {
+        id: String(inserted.rows[0].id),
+        match_id: String(inserted.rows[0].match_id),
+        player_id: String(inserted.rows[0].player_id),
+        event_type: String(inserted.rows[0].event_type),
+        round_number: inserted.rows[0].round_number === null ? null : Number(inserted.rows[0].round_number),
+        timestamp_seconds: Number(inserted.rows[0].timestamp_seconds ?? 0),
+        clip_url: inserted.rows[0].clip_url ?? null,
+        created_at: inserted.rows[0].created_at
+      }
+    };
+  });
+
   app.post("/report", {
     preHandler: [app.authenticate],
     config: { rateLimit: RATE_LIMIT_POLICIES.report }
@@ -5864,9 +7059,11 @@ async function buildServer() {
       .object({
         match_id: z.string().uuid(),
         player_id: z.string().uuid(),
-        reason: z.enum(reportReasons)
+        reason: z.enum(reportReasonsWithAlias),
+        comment: z.string().max(1000).optional()
       })
       .parse(request.body);
+    const normalizedReason = body.reason === "abusive_chat" ? "toxic" : body.reason;
     if (
       !(await enforceAccountRateLimit({
         route: "/report",
@@ -5937,15 +7134,15 @@ async function buildServer() {
     }
 
     await db.query(
-      `INSERT INTO reports (match_id, reporter_id, reported_player_id, reason)
-       VALUES ($1, $2, $3, $4)`,
-      [body.match_id, request.user.playerId, body.player_id, body.reason]
+      `INSERT INTO reports (match_id, reporter_id, reported_player_id, reason, comment)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [body.match_id, request.user.playerId, body.player_id, normalizedReason, body.comment ?? null]
     );
     await createModerationLog({
       action: "report",
       playerId: body.player_id,
       moderatorId: request.user.playerId,
-      reason: body.reason,
+      reason: [normalizedReason, body.comment].filter(Boolean).join(" | "),
       matchId: body.match_id
     });
 
@@ -5994,7 +7191,8 @@ async function buildServer() {
       reporter_id: request.user.playerId,
       reported_player_id: body.player_id,
       match_id: body.match_id,
-      reason: body.reason,
+      reason: normalizedReason,
+      comment: body.comment ?? null,
       report_score: reportScore,
       report_score_weighted: reportScoreWeighted,
       report_weight: reportWeight,
@@ -6016,14 +7214,15 @@ async function buildServer() {
       .object({
         matchId: z.string().uuid(),
         reportedPlayerId: z.string().uuid(),
-        reason: z.enum(reportReasons)
+        reason: z.enum(reportReasonsWithAlias),
+        comment: z.string().max(1000).optional()
       })
       .parse(request.body);
     return app.inject({
       method: "POST",
       url: "/report",
       headers: { authorization: request.headers.authorization ?? "" },
-      payload: { match_id: body.matchId, player_id: body.reportedPlayerId, reason: body.reason }
+      payload: { match_id: body.matchId, player_id: body.reportedPlayerId, reason: body.reason, comment: body.comment }
     }).then((res) => reply.code(res.statusCode).send(JSON.parse(res.body)));
   });
 
@@ -6769,6 +7968,352 @@ async function buildServer() {
     return { ok: true, alert_id: params.id, status, case_id: caseId };
   });
 
+  app.get("/overwatch/live", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchReviewer(request, reply))) return;
+
+    const query = z
+      .object({
+        min_reports: z.coerce.number().int().min(1).max(50).default(4),
+        limit: z.coerce.number().int().min(1).max(100).default(50)
+      })
+      .parse(request.query ?? {});
+
+    const rows = await db.query(
+      `SELECT
+         a.id AS alert_id,
+         a.match_id,
+         a.steam_id AS suspect_steam_id,
+         p.id AS suspect_player_id,
+         COALESCE(NULLIF(p.display_name, ''), a.steam_id) AS suspect_name,
+         m.map,
+         m.status AS match_status,
+         m.server_ip,
+         m.server_port,
+         m.spectator_password,
+         a.score,
+         a.reasons_json,
+         a.status AS alert_status,
+         a.case_id,
+         a.created_at,
+         CASE
+           WHEN (a.reasons_json #>> '{metrics,reports_received}') ~ '^[0-9]+$'
+             THEN (a.reasons_json #>> '{metrics,reports_received}')::int
+           ELSE 0
+         END AS reports_count,
+         (SELECT COUNT(*)::int FROM match_players mp WHERE mp.match_id = m.id) AS players_count
+       FROM anti_cheat_alerts a
+       JOIN matches m ON m.id = a.match_id
+       LEFT JOIN players p ON p.steam_id = a.steam_id
+       WHERE m.status = 'live'
+         AND a.status IN ('open', 'timeout_suggested', 'case_created', 'timeout_applied')
+         AND (
+           CASE
+             WHEN (a.reasons_json #>> '{metrics,reports_received}') ~ '^[0-9]+$'
+               THEN (a.reasons_json #>> '{metrics,reports_received}')::int
+             ELSE 0
+           END
+         ) >= $1
+       ORDER BY reports_count DESC, a.created_at DESC
+       LIMIT $2`,
+      [query.min_reports, query.limit]
+    );
+
+    return rows.rows.map((row) => ({
+      alert_id: row.alert_id,
+      match_id: row.match_id,
+      map: row.map,
+      reports_count: Number(row.reports_count ?? 0),
+      players_count: Number(row.players_count ?? 0),
+      suspect: {
+        steam_id: row.suspect_steam_id,
+        player_id: row.suspect_player_id ?? null,
+        name: row.suspect_name
+      },
+      match_status: row.match_status,
+      alert_status: row.alert_status,
+      case_id: row.case_id ?? null,
+      score: Number(row.score ?? 0),
+      created_at: row.created_at,
+      spectate_command:
+        String(row.match_status) === "live"
+          ? `connect ${row.server_ip}:${row.server_port}; password ${row.spectator_password}`
+          : null
+    }));
+  });
+
+  app.post("/overwatch/live/:alertId/watch", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchReviewer(request, reply))) return;
+    const params = z.object({ alertId: z.string().uuid() }).parse(request.params);
+    const found = await db.query(
+      `SELECT
+         a.id,
+         m.status AS match_status,
+         m.server_ip,
+         m.server_port,
+         m.spectator_password
+       FROM anti_cheat_alerts a
+       JOIN matches m ON m.id = a.match_id
+       WHERE a.id = $1
+       LIMIT 1`,
+      [params.alertId]
+    );
+    if (!found.rowCount) return reply.code(404).send({ error: "Alert not found" });
+    const row = found.rows[0];
+    if (String(row.match_status) !== "live") {
+      return reply.code(409).send({ error: "Match is not live" });
+    }
+    return {
+      ok: true,
+      connect_command: `connect ${row.server_ip}:${row.server_port}; password ${row.spectator_password}`
+    };
+  });
+
+  app.post("/overwatch/live/:alertId/open-case", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchReviewer(request, reply))) return;
+    const params = z.object({ alertId: z.string().uuid() }).parse(request.params);
+    const rowResult = await db.query(
+      `SELECT
+         a.id,
+         a.match_id,
+         a.steam_id,
+         a.score,
+         a.reasons_json,
+         a.case_id,
+         p.id AS player_id
+       FROM anti_cheat_alerts a
+       LEFT JOIN players p ON p.steam_id = a.steam_id
+       WHERE a.id = $1
+       LIMIT 1`,
+      [params.alertId]
+    );
+    if (!rowResult.rowCount) return reply.code(404).send({ error: "Alert not found" });
+    const row = rowResult.rows[0];
+    let caseId = row.case_id ? String(row.case_id) : null;
+    if (!caseId && row.player_id) {
+      const created = await createOverwatchCaseFromSuspicion({
+        player_id: String(row.player_id),
+        match_id: String(row.match_id),
+        suspicion_score: Number(row.score ?? 0),
+        reasons: Array.isArray((row.reasons_json ?? {}).reasons) ? row.reasons_json.reasons : [],
+        metrics: (row.reasons_json ?? {}).metrics ?? {}
+      });
+      caseId = created.caseId ? String(created.caseId) : null;
+    }
+    await db.query(
+      `UPDATE anti_cheat_alerts
+       SET status = CASE WHEN $2::uuid IS NULL THEN status ELSE 'case_created' END,
+           case_id = COALESCE($2, case_id),
+           resolved_by = $3,
+           resolved_note = 'open_case_live_panel',
+           resolved_at = NOW()
+       WHERE id = $1`,
+      [params.alertId, caseId, request.user.playerId]
+    );
+    return { ok: true, alert_id: params.alertId, case_id: caseId };
+  });
+
+  app.post("/overwatch/live/:alertId/timeout-suspect", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchReviewer(request, reply))) return;
+    const params = z.object({ alertId: z.string().uuid() }).parse(request.params);
+    const body = z
+      .object({
+        reason: z.string().min(3).max(300).optional()
+      })
+      .parse(request.body ?? {});
+
+    const alertResult = await db.query(
+      `SELECT
+         a.id,
+         a.match_id,
+         a.steam_id,
+         a.score,
+         a.reasons_json,
+         a.case_id,
+         p.id AS player_id,
+         m.status AS match_status
+       FROM anti_cheat_alerts a
+       JOIN matches m ON m.id = a.match_id
+       LEFT JOIN players p ON p.steam_id = a.steam_id
+       WHERE a.id = $1
+       LIMIT 1`,
+      [params.alertId]
+    );
+    if (!alertResult.rowCount) return reply.code(404).send({ error: "Alert not found" });
+    const alert = alertResult.rows[0];
+
+    if (String(alert.match_status) !== "live") {
+      return reply.code(409).send({ error: "Match is not live" });
+    }
+
+    let caseId = alert.case_id ? String(alert.case_id) : null;
+    if (!caseId && alert.player_id) {
+      const created = await createOverwatchCaseFromSuspicion({
+        player_id: String(alert.player_id),
+        match_id: String(alert.match_id),
+        suspicion_score: Number(alert.score ?? 0),
+        reasons: Array.isArray((alert.reasons_json ?? {}).reasons) ? alert.reasons_json.reasons : [],
+        metrics: (alert.reasons_json ?? {}).metrics ?? {}
+      });
+      caseId = created.caseId ? String(created.caseId) : null;
+    }
+
+    await db.query(
+      `UPDATE anti_cheat_alerts
+       SET status = CASE WHEN $2::uuid IS NULL THEN status ELSE 'case_created' END,
+           case_id = COALESCE($2, case_id),
+           resolved_by = $3,
+           resolved_note = $4,
+           resolved_at = NOW()
+       WHERE id = $1`,
+      [params.alertId, caseId, request.user.playerId, `timeout_suspect_live_panel:${body.reason ?? "reviewer_intervention"}`]
+    );
+
+    await db.query(
+      `UPDATE matches
+       SET status = 'interrupted',
+           interrupted_at = NOW(),
+           recovery_deadline_at = NOW() + INTERVAL '30 minutes'
+       WHERE id = $1`,
+      [String(alert.match_id)]
+    );
+
+    await db.query(
+      `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+       VALUES ($1, 'match_paused_for_overwatch', $2::jsonb, NOW())`,
+      [
+        String(alert.match_id),
+        JSON.stringify({
+          alert_id: params.alertId,
+          case_id: caseId,
+          reason: body.reason ?? "Timeout suspect requested by reviewer"
+        })
+      ]
+    );
+
+    await createModerationLog({
+      action: "timeout",
+      playerId: alert.player_id ? String(alert.player_id) : undefined,
+      moderatorId: String(request.user.playerId),
+      reason: `overwatch_live_timeout; alert=${params.alertId}; ${body.reason ?? "reviewer_intervention"}`,
+      matchId: String(alert.match_id)
+    });
+
+    emitRealtime("match:update", { type: "overwatch_timeout_suspect", match_id: String(alert.match_id), case_id: caseId });
+    emitRealtime("servers:update", { changed: true, reason: "overwatch_timeout_suspect", match_id: String(alert.match_id) });
+
+    return {
+      ok: true,
+      alert_id: params.alertId,
+      match_id: String(alert.match_id),
+      case_id: caseId,
+      player_removed: true,
+      match_paused: true,
+      auto_ban: false
+    };
+  });
+
+  app.post("/overwatch/live/:alertId/cancel-timeout", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchAdmin(request, reply))) return;
+    const params = z.object({ alertId: z.string().uuid() }).parse(request.params);
+    const alert = await db.query(
+      "SELECT id, match_id, steam_id FROM anti_cheat_alerts WHERE id = $1 LIMIT 1",
+      [params.alertId]
+    );
+    if (!alert.rowCount) return reply.code(404).send({ error: "Alert not found" });
+
+    await db.query(
+      `UPDATE anti_cheat_alerts
+       SET status = 'open',
+           resolved_by = $2,
+           resolved_note = 'timeout_cancelled_by_admin',
+           resolved_at = NOW()
+       WHERE id = $1`,
+      [params.alertId, request.user.playerId]
+    );
+
+    await db.query(
+      `UPDATE matches
+       SET status = 'live',
+           interrupted_at = NULL,
+           recovery_deadline_at = NULL
+       WHERE id = $1`,
+      [String(alert.rows[0].match_id)]
+    );
+
+    await db.query(
+      `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+       VALUES ($1, 'match_resumed_by_admin', $2::jsonb, NOW())`,
+      [String(alert.rows[0].match_id), JSON.stringify({ alert_id: params.alertId })]
+    );
+
+    emitRealtime("match:update", { type: "overwatch_timeout_cancelled", match_id: String(alert.rows[0].match_id) });
+    return { ok: true, alert_id: params.alertId, match_id: String(alert.rows[0].match_id), resumed: true };
+  });
+
+  app.post("/overwatch/live/:matchId/resume", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchAdmin(request, reply))) return;
+    const params = z.object({ matchId: z.string().uuid() }).parse(request.params);
+    const match = await db.query("SELECT id FROM matches WHERE id = $1", [params.matchId]);
+    if (!match.rowCount) return reply.code(404).send({ error: "Match not found" });
+
+    await db.query(
+      `UPDATE matches
+       SET status = 'live',
+           interrupted_at = NULL,
+           recovery_deadline_at = NULL
+       WHERE id = $1`,
+      [params.matchId]
+    );
+    await db.query(
+      `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+       VALUES ($1, 'match_resumed_by_admin', $2::jsonb, NOW())`,
+      [params.matchId, JSON.stringify({ source: "overwatch_live_panel" })]
+    );
+    emitRealtime("match:update", { type: "overwatch_resume", match_id: params.matchId });
+    return { ok: true, match_id: params.matchId, resumed: true };
+  });
+
+  app.post("/overwatch/live/:caseId/force-ban", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchAdmin(request, reply))) return;
+    const params = z.object({ caseId: z.string().uuid() }).parse(request.params);
+    const body = z
+      .object({
+        reason: z.string().min(3).max(300).optional()
+      })
+      .parse(request.body ?? {});
+
+    const caseRow = await db.query(
+      "SELECT id, reported_player_id, match_id, demo_url FROM overwatch_cases WHERE id = $1",
+      [params.caseId]
+    );
+    if (!caseRow.rowCount) return reply.code(404).send({ error: "Case not found" });
+    const row = caseRow.rows[0];
+    await applyPunishment(String(row.reported_player_id), String(request.user.playerId), "permanent_ban", {
+      reason: body.reason ?? "Forced ban from live overwatch panel",
+      matchId: String(row.match_id),
+      caseId: params.caseId,
+      evidenceUrl: row.demo_url ? String(row.demo_url) : null
+    });
+    await ensureConfirmedCheatingCase(params.caseId, String(request.user.playerId));
+    await db.query(
+      `UPDATE overwatch_cases
+       SET status = 'resolved', resolved_by = $1, resolution = 'cheating'
+       WHERE id = $2`,
+      [String(request.user.playerId), params.caseId]
+    );
+    await db.query(
+      `UPDATE anti_cheat_alerts
+       SET status = 'resolved',
+           resolved_by = $1,
+           resolved_note = 'force_ban_live_panel',
+           resolved_at = NOW()
+       WHERE case_id = $2`,
+      [String(request.user.playerId), params.caseId]
+    );
+    emitRealtime("servers:update", { changed: true, reason: "overwatch_force_ban", case_id: params.caseId });
+    return { ok: true, case_id: params.caseId, action: "force_ban", banned: true };
+  });
+
   app.post("/internal/highlights/event", async (request, reply) => {
     if (botApiToken) {
       const token = String(request.headers["x-bot-token"] ?? "");
@@ -6983,32 +8528,58 @@ async function buildServer() {
     preHandler: [app.authenticate],
     config: { rateLimit: RATE_LIMIT_POLICIES.casesRead }
   }, async (request, reply) => {
-    if (!(await assertModerator(request, reply))) return;
+    if (!(await assertOverwatchReviewer(request, reply))) return;
 
     const result = await db.query(
       `SELECT
          oc.id AS case_id,
          oc.reported_player_id AS player_id,
+         p.display_name AS reported_player_name,
          oc.match_id,
+         m.map,
          oc.reports,
+         COALESCE(jsonb_array_length(COALESCE(oc.reports::jsonb, '[]'::jsonb)), 0) AS reports_count,
          oc.demo_url,
          oc.status,
          m.status AS match_status,
          m.server_ip,
          m.server_port,
-         m.spectator_password
+         m.spectator_password,
+         COALESCE(vs.total_votes, 0) AS total_votes,
+         COALESCE(vs.cheating_votes, 0) AS cheating_votes,
+         COALESCE(vs.clean_votes, 0) AS clean_votes
        FROM overwatch_cases oc
        JOIN matches m ON m.id = oc.match_id
+       JOIN players p ON p.id = oc.reported_player_id
+       LEFT JOIN (
+         SELECT
+           cv.case_id,
+           COUNT(*)::int AS total_votes,
+           COUNT(*) FILTER (WHERE cv.vote IN ('cheating', 'griefing'))::int AS cheating_votes,
+           COUNT(*) FILTER (WHERE cv.vote IN ('clean', 'not_cheating', 'insufficient_evidence'))::int AS clean_votes
+         FROM case_votes cv
+         GROUP BY cv.case_id
+       ) vs ON vs.case_id = oc.id
        ORDER BY oc.created_at DESC`
     );
 
     return result.rows.map((row) => ({
       case_id: row.case_id,
       player_id: row.player_id,
+      reported_player_name: row.reported_player_name,
       match_id: row.match_id,
+      map: row.map,
       reports: row.reports,
+      reports_count: Number(row.reports_count ?? 0),
       demo_url: row.demo_url,
       status: row.status,
+      consensus: {
+        required: overwatchConsensusRequired,
+        max_votes: overwatchConsensusMaxVotes,
+        total_votes: Number(row.total_votes ?? 0),
+        cheating_votes: Number(row.cheating_votes ?? 0),
+        clean_votes: Number(row.clean_votes ?? 0)
+      },
       spectate_command:
         row.match_status === "live"
           ? `connect ${row.server_ip}:${row.server_port}; password ${row.spectator_password}`
@@ -7020,13 +8591,215 @@ async function buildServer() {
     preHandler: [app.authenticate],
     config: { rateLimit: RATE_LIMIT_POLICIES.casesRead }
   }, async (request, reply) => {
-    if (!(await assertModerator(request, reply))) return;
+    if (!(await assertOverwatchReviewer(request, reply))) return;
     const response = await app.inject({
       method: "GET",
       url: "/cases",
       headers: { authorization: request.headers.authorization ?? "" }
     });
     return reply.code(response.statusCode).send(JSON.parse(response.body));
+  });
+
+  app.get("/cases/:id", {
+    preHandler: [app.authenticate],
+    config: { rateLimit: RATE_LIMIT_POLICIES.casesRead }
+  }, async (request, reply) => {
+    if (!(await assertOverwatchReviewer(request, reply))) return;
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+
+    const row = await db.query(
+      `SELECT
+         oc.id AS case_id,
+         oc.reported_player_id AS player_id,
+         p.display_name AS reported_player_name,
+         p.steam_id AS reported_player_steam_id,
+         oc.match_id,
+         m.map,
+         m.status AS match_status,
+         m.created_at AS match_created_at,
+         m.demo_url AS match_demo_url,
+         m.server_ip,
+         m.server_port,
+         m.spectator_password,
+         oc.reports,
+         COALESCE(jsonb_array_length(COALESCE(oc.reports::jsonb, '[]'::jsonb)), 0) AS reports_count,
+         oc.demo_url AS case_demo_url,
+         oc.status,
+         COALESCE(vs.total_votes, 0) AS total_votes,
+         COALESCE(vs.cheating_votes, 0) AS cheating_votes,
+         COALESCE(vs.clean_votes, 0) AS clean_votes
+       FROM overwatch_cases oc
+       JOIN players p ON p.id = oc.reported_player_id
+       JOIN matches m ON m.id = oc.match_id
+       LEFT JOIN (
+         SELECT
+           cv.case_id,
+           COUNT(*)::int AS total_votes,
+           COUNT(*) FILTER (WHERE cv.vote IN ('cheating', 'griefing'))::int AS cheating_votes,
+           COUNT(*) FILTER (WHERE cv.vote IN ('clean', 'not_cheating', 'insufficient_evidence'))::int AS clean_votes
+         FROM case_votes cv
+         GROUP BY cv.case_id
+       ) vs ON vs.case_id = oc.id
+       WHERE oc.id = $1`,
+      [params.id]
+    );
+    if (!row.rowCount) return reply.code(404).send({ error: "Case not found" });
+
+    const votes = await db.query(
+      `SELECT cv.case_id, cv.moderator_id, cv.vote, cv.created_at, p.display_name AS reviewer_name
+       FROM case_votes cv
+       LEFT JOIN players p ON p.id = cv.moderator_id
+       WHERE cv.case_id = $1
+       ORDER BY cv.created_at ASC`,
+      [params.id]
+    );
+
+    const caseRow = row.rows[0];
+    return {
+      case_id: caseRow.case_id,
+      player_id: caseRow.player_id,
+      reported_player_name: caseRow.reported_player_name,
+      reported_player_steam_id: caseRow.reported_player_steam_id,
+      match_id: caseRow.match_id,
+      map: caseRow.map,
+      match_status: caseRow.match_status,
+      match_created_at: caseRow.match_created_at,
+      reports: caseRow.reports,
+      reports_count: Number(caseRow.reports_count ?? 0),
+      demo_url: caseRow.case_demo_url ?? caseRow.match_demo_url ?? null,
+      spectate_command:
+        caseRow.match_status === "live"
+          ? `connect ${caseRow.server_ip}:${caseRow.server_port}; password ${caseRow.spectator_password}`
+          : null,
+      status: caseRow.status,
+      consensus: {
+        required: overwatchConsensusRequired,
+        max_votes: overwatchConsensusMaxVotes,
+        total_votes: Number(caseRow.total_votes ?? 0),
+        cheating_votes: Number(caseRow.cheating_votes ?? 0),
+        clean_votes: Number(caseRow.clean_votes ?? 0)
+      },
+      votes: votes.rows
+    };
+  });
+
+  app.post("/cases/:id/reopen", { preHandler: [app.authenticate] }, async (request, reply) => {
+    try {
+      await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const found = await db.query("SELECT id FROM overwatch_cases WHERE id = $1", [params.id]);
+    if (!found.rowCount) return reply.code(404).send({ error: "Case not found" });
+
+    await db.query(
+      `UPDATE overwatch_cases
+       SET status = 'open', resolved_by = NULL, resolution = NULL
+       WHERE id = $1`,
+      [params.id]
+    );
+    await db.query("DELETE FROM case_votes WHERE case_id = $1", [params.id]);
+    return { ok: true, case_id: params.id, status: "open" };
+  });
+
+  app.post("/cases/:id/force-verdict", { preHandler: [app.authenticate] }, async (request, reply) => {
+    let adminUser: any;
+    try {
+      adminUser = await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = z
+      .object({
+        verdict: z.enum(["cheating", "insufficient_evidence", "not_cheating"])
+      })
+      .parse(request.body ?? {});
+
+    const existingCase = await db.query(
+      "SELECT id, reported_player_id, status, match_id, demo_url FROM overwatch_cases WHERE id = $1",
+      [params.id]
+    );
+    if (!existingCase.rowCount) {
+      return reply.code(404).send({ error: "Case not found" });
+    }
+
+    if (body.verdict === "cheating") {
+      await applyPunishment(String(existingCase.rows[0].reported_player_id), String(adminUser.playerId), "permanent_ban", {
+        reason: "Cheating (forced verdict)",
+        matchId: String(existingCase.rows[0].match_id),
+        caseId: params.id,
+        evidenceUrl: existingCase.rows[0].demo_url ? String(existingCase.rows[0].demo_url) : null
+      });
+      await ensureConfirmedCheatingCase(params.id, String(adminUser.playerId));
+    }
+
+    await db.query(
+      `UPDATE overwatch_cases
+       SET status = 'resolved', resolved_by = $1, resolution = $2
+       WHERE id = $3`,
+      [String(adminUser.playerId), body.verdict, params.id]
+    );
+
+    await createNotification({
+      playerId: String(existingCase.rows[0].reported_player_id),
+      kind: "overwatch_verdict",
+      title: "Overwatch verdict",
+      message:
+        body.verdict === "cheating"
+          ? "Your case was resolved as cheating."
+          : body.verdict === "not_cheating"
+            ? "Your case was resolved as not cheating."
+            : "Your case was closed due to insufficient evidence.",
+      metadata: {
+        case_id: params.id,
+        match_id: String(existingCase.rows[0].match_id),
+        verdict: body.verdict,
+        forced: true
+      }
+    });
+
+    await createModerationLog({
+      action: "overwatch_force_verdict",
+      playerId: String(existingCase.rows[0].reported_player_id),
+      moderatorId: String(adminUser.playerId),
+      reason: `case=${params.id}; verdict=${body.verdict}`,
+      matchId: String(existingCase.rows[0].match_id)
+    });
+
+    return { ok: true, case_id: params.id, verdict: body.verdict };
+  });
+
+  app.post("/cases/:id/remove-false-ban", { preHandler: [app.authenticate] }, async (request, reply) => {
+    let adminUser: any;
+    try {
+      adminUser = await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const caseRow = await db.query("SELECT reported_player_id, match_id FROM overwatch_cases WHERE id = $1", [params.id]);
+    if (!caseRow.rowCount) return reply.code(404).send({ error: "Case not found" });
+    const playerId = String(caseRow.rows[0].reported_player_id);
+
+    await db.query("UPDATE players SET permanent_ban = FALSE, banned_until = NULL WHERE id = $1", [playerId]);
+    await createModerationLog({
+      action: "unban",
+      playerId,
+      moderatorId: String(adminUser.playerId),
+      reason: `False positive removal via case=${params.id}`,
+      matchId: String(caseRow.rows[0].match_id)
+    });
+
+    await db.query(
+      `UPDATE overwatch_cases
+       SET status = 'resolved', resolved_by = $1, resolution = 'false_positive'
+       WHERE id = $2`,
+      [String(adminUser.playerId), params.id]
+    );
+
+    return { ok: true, case_id: params.id, player_id: playerId, action: "unban" };
   });
 
   app.get("/ban-evasion/cases", {
@@ -7277,7 +9050,7 @@ async function buildServer() {
     preHandler: [app.authenticate],
     config: { rateLimit: RATE_LIMIT_POLICIES.casesVote }
   }, async (request, reply) => {
-    if (!(await assertModerator(request, reply))) return;
+    if (!(await assertOverwatchReviewer(request, reply))) return;
 
     const body = z
       .object({
@@ -7309,11 +9082,14 @@ async function buildServer() {
     const totalVotes = votes.rowCount ?? 0;
     const cheatingVotes = votes.rows.filter((v) => v.vote === "cheating").length;
     const griefingVotes = votes.rows.filter((v) => v.vote === "griefing").length;
+    const cleanVotes = votes.rows.filter((v) => ["clean", "not_cheating", "insufficient_evidence"].includes(String(v.vote))).length;
     const guiltyVotes = cheatingVotes + griefingVotes;
     const guiltyRatio = totalVotes > 0 ? guiltyVotes / totalVotes : 0;
+    const enoughVotes = totalVotes >= overwatchConsensusRequired;
 
     let punishmentApplied: string | null = null;
-    if (guiltyRatio >= 0.7 && totalVotes > 0) {
+    let resolvedVerdict: "cheating" | "not_cheating" | "insufficient_evidence" | null = null;
+    if (enoughVotes && guiltyVotes >= overwatchConsensusRequired) {
       let punishment: "timeout_24h" | "ban_7d" | "permanent_ban";
       if (cheatingVotes >= griefingVotes) {
         punishment = "permanent_ban";
@@ -7340,6 +9116,43 @@ async function buildServer() {
         await ensureConfirmedCheatingCase(body.case_id, request.user.playerId);
         await rewardReportersForCase(body.case_id, 10, 5);
       }
+      resolvedVerdict = "cheating";
+    } else if (enoughVotes && cleanVotes >= overwatchConsensusRequired) {
+      await db.query(
+        `UPDATE overwatch_cases
+         SET status = 'resolved', resolved_by = $1, resolution = $2
+         WHERE id = $3`,
+        [request.user.playerId, "not_cheating", body.case_id]
+      );
+      resolvedVerdict = "not_cheating";
+    } else if (totalVotes >= overwatchConsensusMaxVotes) {
+      await db.query(
+        `UPDATE overwatch_cases
+         SET status = 'resolved', resolved_by = $1, resolution = $2
+         WHERE id = $3`,
+        [request.user.playerId, "insufficient_evidence", body.case_id]
+      );
+      resolvedVerdict = "insufficient_evidence";
+    }
+
+    if (resolvedVerdict) {
+      await createNotification({
+        playerId: String(existingCase.rows[0].reported_player_id),
+        kind: "overwatch_verdict",
+        title: "Overwatch verdict",
+        message:
+          resolvedVerdict === "cheating"
+            ? "Your case was resolved as cheating."
+            : resolvedVerdict === "not_cheating"
+              ? "Your case was resolved as not cheating."
+              : "Your case was closed due to insufficient evidence.",
+        metadata: {
+          case_id: body.case_id,
+          match_id: String(existingCase.rows[0].match_id),
+          verdict: resolvedVerdict,
+          punishment: punishmentApplied
+        }
+      });
     }
 
     await createModerationLog({
@@ -7353,7 +9166,13 @@ async function buildServer() {
     return reply.send({
       ok: true,
       case_id: body.case_id,
+      consensus: {
+        required: overwatchConsensusRequired,
+        max_votes: overwatchConsensusMaxVotes
+      },
       total_votes: totalVotes,
+      cheating_votes: cheatingVotes,
+      clean_votes: cleanVotes,
       guilty_ratio: guiltyRatio,
       punishment_applied: punishmentApplied
     });
@@ -7477,6 +9296,191 @@ async function buildServer() {
     return result.rows;
   });
 
+  app.post("/overwatch/apply", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const body = z
+      .object({
+        fraghub_username: z.string().min(2).max(64),
+        motivation: z.string().min(20).max(2000),
+        moderation_experience: z.string().min(5).max(2000)
+      })
+      .parse(request.body ?? {});
+
+    const player = await db.query(
+      `SELECT p.id, p.display_name, p.player_rank, p.created_at, p.permanent_ban, p.banned_until
+       FROM players p
+       WHERE p.id = $1
+       LIMIT 1`,
+      [request.user.playerId]
+    );
+    if (!player.rowCount) {
+      return reply.code(404).send({ error: "Player not found" });
+    }
+    const playerRow = player.rows[0];
+    const stats = await db.query(
+      `SELECT COALESCE(matches_played, 0)::int AS matches_played
+       FROM player_stats
+       WHERE player_id = $1
+       LIMIT 1`,
+      [request.user.playerId]
+    );
+    const matchesPlayed = Number(stats.rows[0]?.matches_played ?? 0);
+    const rank = String(playerRow.player_rank ?? "Silver");
+    const accountAgeDays = Math.max(
+      0,
+      Math.floor((Date.now() - new Date(String(playerRow.created_at ?? Date.now())).getTime()) / (24 * 60 * 60 * 1000))
+    );
+    const currentlyBanned =
+      Boolean(playerRow.permanent_ban) ||
+      (playerRow.banned_until ? new Date(String(playerRow.banned_until)).getTime() > Date.now() : false);
+    const historicalBans = await db.query("SELECT COUNT(*)::int AS bans FROM ban_logs WHERE steam_id = $1", [request.user.steamId]);
+    const bansOnRecord = Number(historicalBans.rows[0]?.bans ?? 0);
+
+    const rankOrder = new Map<string, number>([
+      ["Silver", 1],
+      ["Gold Nova", 2],
+      ["Master Guardian", 3],
+      ["Distinguished Master Guardian", 4],
+      ["Legendary Eagle", 5],
+      ["Supreme", 6],
+      ["Global Elite", 7]
+    ]);
+    const rankScore = rankOrder.get(rank) ?? 0;
+
+    const requirementResult = {
+      minimum_rank_ok: rankScore >= 3,
+      minimum_matches_ok: matchesPlayed >= 100,
+      account_age_ok: accountAgeDays >= 30,
+      no_bans_ok: !currentlyBanned && bansOnRecord === 0
+    };
+    const eligible =
+      requirementResult.minimum_rank_ok &&
+      requirementResult.minimum_matches_ok &&
+      requirementResult.account_age_ok &&
+      requirementResult.no_bans_ok;
+    if (!eligible) {
+      return reply.code(400).send({
+        error: "OVERWATCH_REQUIREMENTS_NOT_MET",
+        requirements: {
+          minimum_rank: "Master Guardian I or higher",
+          minimum_matches: 100,
+          account_age_days: 30,
+          no_bans: true
+        },
+        current: {
+          rank,
+          matches_played: matchesPlayed,
+          account_age_days: accountAgeDays,
+          bans_on_record: bansOnRecord
+        },
+        checks: requirementResult
+      });
+    }
+
+    const existing = await db.query(
+      `SELECT id, status
+       FROM overwatch_applications
+       WHERE player_id = $1
+       LIMIT 1`,
+      [request.user.playerId]
+    );
+    if (existing.rowCount && String(existing.rows[0].status) === "pending") {
+      return reply.code(409).send({ error: "OVERWATCH_APPLICATION_ALREADY_PENDING" });
+    }
+
+    await db.query(
+      `INSERT INTO overwatch_applications
+         (player_id, fraghub_username, motivation, moderation_experience, status, reviewed_by, reviewed_at, rejection_reason, updated_at)
+       VALUES ($1, $2, $3, $4, 'pending', NULL, NULL, NULL, NOW())
+       ON CONFLICT (player_id)
+       DO UPDATE SET
+         fraghub_username = EXCLUDED.fraghub_username,
+         motivation = EXCLUDED.motivation,
+         moderation_experience = EXCLUDED.moderation_experience,
+         status = 'pending',
+         reviewed_by = NULL,
+         reviewed_at = NULL,
+         rejection_reason = NULL,
+         updated_at = NOW()`,
+      [request.user.playerId, body.fraghub_username, body.motivation, body.moderation_experience]
+    );
+
+    return { ok: true, status: "pending" };
+  });
+
+  app.get("/overwatch/applications", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchAdmin(request, reply))) return;
+    const rows = await db.query(
+      `SELECT
+         oa.id,
+         oa.player_id,
+         p.steam_id,
+         p.display_name,
+         p.player_rank,
+         oa.fraghub_username,
+         oa.motivation,
+         oa.moderation_experience,
+         oa.status,
+         oa.created_at,
+         oa.reviewed_at,
+         oa.rejection_reason
+       FROM overwatch_applications oa
+       JOIN players p ON p.id = oa.player_id
+       ORDER BY oa.created_at DESC`
+    );
+    return rows.rows;
+  });
+
+  app.post("/overwatch/applications/:id/approve", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchAdmin(request, reply))) return;
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const found = await db.query(
+      `SELECT id, player_id, status
+       FROM overwatch_applications
+       WHERE id = $1
+       LIMIT 1`,
+      [params.id]
+    );
+    if (!found.rowCount) return reply.code(404).send({ error: "Application not found" });
+
+    const playerId = String(found.rows[0].player_id);
+    await db.query(
+      `UPDATE overwatch_applications
+       SET status = 'approved', reviewed_by = $2, reviewed_at = NOW(), rejection_reason = NULL, updated_at = NOW()
+       WHERE id = $1`,
+      [params.id, request.user.playerId]
+    );
+    await db.query(
+      `UPDATE players
+       SET role = CASE
+         WHEN LOWER(role) IN ('owner','admin','moderator') THEN role
+         ELSE 'overwatch'
+       END
+       WHERE id = $1`,
+      [playerId]
+    );
+    return { ok: true, application_id: params.id, status: "approved", player_id: playerId, role: "overwatch" };
+  });
+
+  app.post("/overwatch/applications/:id/reject", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertOverwatchAdmin(request, reply))) return;
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const body = z.object({ reason: z.string().min(3).max(500).optional() }).parse(request.body ?? {});
+    const found = await db.query("SELECT id FROM overwatch_applications WHERE id = $1 LIMIT 1", [params.id]);
+    if (!found.rowCount) return reply.code(404).send({ error: "Application not found" });
+
+    await db.query(
+      `UPDATE overwatch_applications
+       SET status = 'rejected',
+           reviewed_by = $2,
+           reviewed_at = NOW(),
+           rejection_reason = $3,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [params.id, request.user.playerId, body.reason ?? "Application rejected"]
+    );
+    return { ok: true, application_id: params.id, status: "rejected" };
+  });
+
   app.post("/creator/approve", { preHandler: [app.authenticate] }, async (request, reply) => {
     if (!(await assertModerator(request, reply))) return;
     const body = z
@@ -7524,6 +9528,341 @@ async function buildServer() {
     );
 
     return { ok: true, player_id: body.player_id, creator_code: creatorCode };
+  });
+
+  app.get("/creator/lobbies", async () => {
+    const rows = await db.query(
+      `SELECT
+         cl.id,
+         cl.creator_player_id,
+         creator.display_name AS creator_name,
+         creator.steam_id AS creator_steam_id,
+         creator.player_rank AS creator_rank,
+         cl.mode,
+         cl.map_pool,
+         cl.max_players,
+         cl.status,
+         cl.match_id,
+         cl.server_id,
+         cl.created_at,
+         COALESCE(lp.joined_players, 0) AS joined_players
+       FROM creator_lobbies cl
+       JOIN players creator ON creator.id = cl.creator_player_id
+       LEFT JOIN (
+         SELECT lobby_id, COUNT(*)::int AS joined_players
+         FROM creator_lobby_players
+         GROUP BY lobby_id
+       ) lp ON lp.lobby_id = cl.id
+       WHERE cl.status IN ('open', 'starting', 'live')
+       ORDER BY cl.created_at DESC`
+    );
+    return rows.rows.map((row) => ({
+      id: String(row.id),
+      creator: {
+        player_id: String(row.creator_player_id),
+        steam_id: String(row.creator_steam_id),
+        name: String(row.creator_name ?? "Creator"),
+        rank: String(row.creator_rank ?? "Silver I")
+      },
+      mode: String(row.mode),
+      map_pool: Array.isArray(row.map_pool) ? row.map_pool : [],
+      max_players: Number(row.max_players ?? 10),
+      players_joined: Number(row.joined_players ?? 0),
+      status: String(row.status ?? "open"),
+      match_id: row.match_id ? String(row.match_id) : null,
+      server_id: row.server_id ? String(row.server_id) : null,
+      created_at: row.created_at
+    }));
+  });
+
+  app.post("/creator/lobbies", { preHandler: [app.authenticate] }, async (request, reply) => {
+    if (!(await assertCreatorHost(request, reply))) return;
+
+    const body = z
+      .object({
+        mode: z.enum(["ranked", "wingman", "casual", "clanwars"]).default("ranked"),
+        map_pool: z.array(z.string().min(2).max(64)).max(10).optional(),
+        max_players: z.number().int().min(2).max(20).optional()
+      })
+      .parse(request.body ?? {});
+
+    const mode = body.mode as QueueMode;
+    const cfg = modeConfig[mode];
+    const desiredPlayers = body.max_players ?? cfg.playersPerMatch;
+    if (desiredPlayers % 2 !== 0) {
+      return reply.code(400).send({ error: "MAX_PLAYERS_MUST_BE_EVEN" });
+    }
+
+    const creatorPlayerId = String(request.user.playerId);
+    const creator = await db.query("SELECT id FROM players WHERE id = $1 LIMIT 1", [creatorPlayerId]);
+    if (!creator.rowCount) return reply.code(404).send({ error: "PLAYER_NOT_FOUND" });
+
+    const existing = await db.query(
+      `SELECT id FROM creator_lobbies
+       WHERE creator_player_id = $1
+         AND status IN ('open', 'starting', 'live')
+       LIMIT 1`,
+      [creatorPlayerId]
+    );
+    if (existing.rowCount) {
+      return reply.code(409).send({ error: "CREATOR_ALREADY_HAS_ACTIVE_LOBBY", lobby_id: existing.rows[0].id });
+    }
+
+    const maps = (body.map_pool && body.map_pool.length ? body.map_pool : [...MAP_POOL]).filter((m: string) => MAP_POOL.includes(m as any));
+    const inserted = await db.query(
+      `INSERT INTO creator_lobbies (creator_player_id, mode, map_pool, max_players, status, created_at, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, 'open', NOW(), NOW())
+       RETURNING id`,
+      [creatorPlayerId, mode, JSON.stringify(maps), desiredPlayers]
+    );
+    const lobbyId = String(inserted.rows[0].id);
+
+    await db.query(
+      `INSERT INTO creator_lobby_players (lobby_id, player_id, joined_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (lobby_id, player_id) DO NOTHING`,
+      [lobbyId, creatorPlayerId]
+    );
+
+    emitRealtime("queue:update", { type: "creator_lobby_created", lobby_id: lobbyId, mode, max_players: desiredPlayers });
+    return { ok: true, lobby_id: lobbyId };
+  });
+
+  app.get("/creator/lobbies/:id", async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const lobby = await db.query(
+      `SELECT
+         cl.id,
+         cl.creator_player_id,
+         creator.display_name AS creator_name,
+         creator.steam_id AS creator_steam_id,
+         creator.player_rank AS creator_rank,
+         cl.mode,
+         cl.map_pool,
+         cl.max_players,
+         cl.status,
+         cl.match_id,
+         cl.server_id,
+         cl.created_at
+       FROM creator_lobbies cl
+       JOIN players creator ON creator.id = cl.creator_player_id
+       WHERE cl.id = $1
+       LIMIT 1`,
+      [params.id]
+    );
+    if (!lobby.rowCount) return reply.code(404).send({ error: "LOBBY_NOT_FOUND" });
+
+    const players = await db.query(
+      `SELECT
+         p.id AS player_id,
+         p.steam_id,
+         p.display_name,
+         p.player_rank,
+         clp.joined_at
+       FROM creator_lobby_players clp
+       JOIN players p ON p.id = clp.player_id
+       WHERE clp.lobby_id = $1
+       ORDER BY clp.joined_at ASC`,
+      [params.id]
+    );
+    const row = lobby.rows[0];
+    return {
+      id: String(row.id),
+      creator: {
+        player_id: String(row.creator_player_id),
+        steam_id: String(row.creator_steam_id),
+        name: String(row.creator_name ?? "Creator"),
+        rank: String(row.creator_rank ?? "Silver I")
+      },
+      mode: String(row.mode),
+      map_pool: Array.isArray(row.map_pool) ? row.map_pool : [],
+      max_players: Number(row.max_players ?? 10),
+      status: String(row.status ?? "open"),
+      match_id: row.match_id ? String(row.match_id) : null,
+      server_id: row.server_id ? String(row.server_id) : null,
+      created_at: row.created_at,
+      players: players.rows.map((p) => ({
+        player_id: String(p.player_id),
+        steam_id: String(p.steam_id),
+        display_name: String(p.display_name ?? p.steam_id),
+        rank: String(p.player_rank ?? "Silver I"),
+        joined_at: p.joined_at
+      }))
+    };
+  });
+
+  app.post("/creator/lobbies/:id/join", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const lobby = await db.query(
+      `SELECT id, max_players, status
+       FROM creator_lobbies
+       WHERE id = $1
+       LIMIT 1`,
+      [params.id]
+    );
+    if (!lobby.rowCount) return reply.code(404).send({ error: "LOBBY_NOT_FOUND" });
+    const row = lobby.rows[0];
+    if (String(row.status) !== "open") return reply.code(409).send({ error: "LOBBY_NOT_JOINABLE" });
+
+    const count = await db.query("SELECT COUNT(*)::int AS n FROM creator_lobby_players WHERE lobby_id = $1", [params.id]);
+    const joined = Number(count.rows[0]?.n ?? 0);
+    const maxPlayers = Number(row.max_players ?? 10);
+    if (joined >= maxPlayers) return reply.code(409).send({ error: "LOBBY_FULL" });
+
+    await db.query(
+      `INSERT INTO creator_lobby_players (lobby_id, player_id, joined_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (lobby_id, player_id) DO NOTHING`,
+      [params.id, String(request.user.playerId)]
+    );
+    emitRealtime("queue:update", { type: "creator_lobby_join", lobby_id: params.id });
+    return { ok: true, lobby_id: params.id };
+  });
+
+  app.post("/creator/lobbies/:id/leave", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    await db.query("DELETE FROM creator_lobby_players WHERE lobby_id = $1 AND player_id = $2", [params.id, String(request.user.playerId)]);
+    emitRealtime("queue:update", { type: "creator_lobby_leave", lobby_id: params.id });
+    return { ok: true, lobby_id: params.id };
+  });
+
+  app.post("/creator/lobbies/:id/start", { preHandler: [app.authenticate] }, async (request, reply) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const lobby = await db.query(
+      `SELECT id, creator_player_id, mode, map_pool, max_players, status, match_id
+       FROM creator_lobbies
+       WHERE id = $1
+       LIMIT 1`,
+      [params.id]
+    );
+    if (!lobby.rowCount) return reply.code(404).send({ error: "LOBBY_NOT_FOUND" });
+    const row = lobby.rows[0];
+    const actorRole = String(request.user.role ?? "player").toLowerCase();
+    const isAdminOverride = actorRole === "owner" || actorRole === "admin" || actorRole === "moderator";
+    if (!isAdminOverride && String(row.creator_player_id) !== String(request.user.playerId)) {
+      return reply.code(403).send({ error: "ONLY_CREATOR_CAN_START" });
+    }
+    if (String(row.status) !== "open") {
+      return reply.code(409).send({ error: "LOBBY_NOT_STARTABLE" });
+    }
+    if (row.match_id) {
+      return reply.code(409).send({ error: "LOBBY_ALREADY_STARTED", match_id: row.match_id });
+    }
+
+    const participants = await db.query(
+      `SELECT p.id AS player_id
+       FROM creator_lobby_players clp
+       JOIN players p ON p.id = clp.player_id
+       WHERE clp.lobby_id = $1
+       ORDER BY clp.joined_at ASC`,
+      [params.id]
+    );
+    const mode = String(row.mode) as QueueMode;
+    const cfg = modeConfig[mode] ?? modeConfig.ranked;
+    const joinedPlayers = participants.rows.map((p) => String(p.player_id));
+    if (joinedPlayers.length < 2) {
+      return reply.code(400).send({ error: "NOT_ENOUGH_PLAYERS" });
+    }
+
+    const maps = Array.isArray(row.map_pool) && row.map_pool.length ? row.map_pool : [...MAP_POOL];
+    const selectedMap = maps[Math.floor(Math.random() * maps.length)] ?? MAP_POOL[0];
+
+    await db.query("UPDATE creator_lobbies SET status = 'starting', updated_at = NOW() WHERE id = $1", [params.id]);
+
+    const startRes = await fetch(`${process.env.SERVER_MANAGER_BASE_URL ?? "http://server-manager:3003"}/servers/start`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(serverManagerApiToken ? { "x-server-manager-token": serverManagerApiToken } : {}),
+        ...(internalApiToken ? { "x-internal-token": internalApiToken } : {})
+      },
+      body: JSON.stringify({
+        mode,
+        map: selectedMap
+      })
+    });
+    if (!startRes.ok) {
+      const errText = await startRes.text();
+      await db.query("UPDATE creator_lobbies SET status = 'open', updated_at = NOW() WHERE id = $1", [params.id]);
+      return reply.code(502).send({ success: false, error: "SERVER_START_FAILED", details: errText.slice(0, 400) });
+    }
+    const server = (await startRes.json()) as {
+      server_id: string;
+      server_ip: string;
+      port: number;
+      server_password: string;
+      spectator_password: string;
+      connect_string: string;
+      map: string;
+    };
+
+    const insertedMatch = await db.query(
+      `INSERT INTO matches (
+          map, status, server_id, server_ip, server_port, server_password, spectator_password, connect_string,
+          mode, unranked, started_at, created_at, creator_match, creator_player_id
+       )
+       VALUES ($1, 'live', $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW(), TRUE, $10)
+       RETURNING id`,
+      [
+        server.map ?? selectedMap,
+        server.server_id,
+        server.server_ip,
+        server.port,
+        server.server_password,
+        server.spectator_password,
+        server.connect_string,
+        mode,
+        cfg.unranked,
+        String(row.creator_player_id)
+      ]
+    );
+    const matchId = String(insertedMatch.rows[0].id);
+
+    const teamSize = Math.floor(joinedPlayers.length / 2);
+    const teamA = joinedPlayers.slice(0, teamSize);
+    const teamB = joinedPlayers.slice(teamSize);
+    for (const playerId of teamA) {
+      await db.query("INSERT INTO match_players (match_id, player_id, team) VALUES ($1, $2, 'A') ON CONFLICT DO NOTHING", [matchId, playerId]);
+    }
+    for (const playerId of teamB) {
+      await db.query("INSERT INTO match_players (match_id, player_id, team) VALUES ($1, $2, 'B') ON CONFLICT DO NOTHING", [matchId, playerId]);
+    }
+
+    await db.query(
+      `UPDATE creator_lobbies
+       SET status = 'live',
+           match_id = $2,
+           server_id = $3,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [params.id, matchId, server.server_id]
+    );
+    await db.query(
+      `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+       VALUES ($1, 'creator_lobby_started', $2::jsonb, NOW())`,
+      [
+        matchId,
+        JSON.stringify({
+          lobby_id: params.id,
+          creator_player_id: String(row.creator_player_id),
+          mode,
+          map: server.map ?? selectedMap
+        })
+      ]
+    );
+
+    emitRealtime("match:update", { type: "creator_lobby_started", match_id: matchId, lobby_id: params.id });
+    emitRealtime("servers:update", { changed: true });
+
+    return {
+      success: true,
+      lobby_id: params.id,
+      match_id: matchId,
+      mode,
+      map: server.map ?? selectedMap,
+      connect_command: `connect ${server.server_ip}:${server.port}; password ${server.server_password}`,
+      spectate_command: `connect ${server.server_ip}:${server.port}; password ${server.spectator_password}`
+    };
   });
 
   app.get("/leaderboard/hunters", async () => {
@@ -7670,6 +10009,300 @@ async function buildServer() {
     return { logs: rows.rows };
   });
 
+  app.get("/admin/servers", async (request, reply) => {
+    try {
+      await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+    try {
+      const response = await fetch(`${process.env.SERVER_MANAGER_BASE_URL ?? "http://server-manager:3003"}/servers`, {
+        headers: {
+          ...(serverManagerApiToken ? { "x-server-manager-token": serverManagerApiToken } : {}),
+          ...(internalApiToken ? { "x-internal-token": internalApiToken } : {})
+        }
+      });
+      if (!response.ok) {
+        return reply.code(502).send({ success: false, error: "SERVER_MANAGER_UNAVAILABLE" });
+      }
+      const servers = await response.json();
+      emitRealtime("servers:update", servers);
+      return { success: true, servers };
+    } catch {
+      return reply.code(502).send({ success: false, error: "SERVER_MANAGER_UNAVAILABLE" });
+    }
+  });
+
+  app.get("/admin/queue", async (request, reply) => {
+    try {
+      await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+    const modes = queueModes as readonly QueueMode[];
+    const counts = await Promise.all(
+      modes.map(async (mode) => {
+        const normal = await redis.zcard(queueOrderKey(mode, "normal"));
+        const smurf = mode === "clanwars" ? 0 : await redis.zcard(queueOrderKey(mode, "smurf"));
+        return [mode, Number(normal) + Number(smurf)] as const;
+      })
+    );
+    const payload = Object.fromEntries(counts);
+    emitRealtime("queue:update", payload);
+    return { success: true, queue: payload };
+  });
+
+  app.get("/admin/reports", async (request, reply) => {
+    try {
+      await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+    const [reports, bans] = await Promise.all([
+      db.query(
+        `SELECT r.id, r.reason, r.created_at, r.match_id,
+                rp.steam_id AS reporter_steam_id,
+                tp.steam_id AS reported_steam_id
+         FROM reports r
+         JOIN players rp ON rp.id = r.reporter_id
+         JOIN players tp ON tp.id = r.reported_player_id
+         ORDER BY r.created_at DESC
+         LIMIT 200`
+      ),
+      db.query(
+        `SELECT id, steam_id, discord_id, reason, match_id, case_id, created_at
+         FROM ban_logs
+         ORDER BY created_at DESC
+         LIMIT 200`
+      )
+    ]);
+    return { success: true, reports: reports.rows, bans: bans.rows };
+  });
+
+  app.post("/admin/bans", async (request, reply) => {
+    let adminUser: any;
+    try {
+      adminUser = await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+    const body = z
+      .object({
+        player_id: z.string().uuid(),
+        reason: z.string().min(3).max(256),
+        permanent: z.boolean().default(true),
+        days: z.number().int().positive().optional()
+      })
+      .parse(request.body ?? {});
+    if (body.permanent) {
+      await db.query("UPDATE players SET permanent_ban = TRUE, banned_until = NULL WHERE id = $1", [body.player_id]);
+    } else {
+      await db.query("UPDATE players SET permanent_ban = FALSE, banned_until = NOW() + ($2 || ' days')::interval WHERE id = $1", [
+        body.player_id,
+        body.days ?? 7
+      ]);
+    }
+    await createBanLog({
+      targetPlayerId: body.player_id,
+      reason: body.reason
+    });
+    await createModerationLog({
+      action: "ban",
+      playerId: body.player_id,
+      moderatorId: String(adminUser.playerId),
+      reason: body.reason
+    });
+    return { success: true };
+  });
+
+  app.post("/admin/testmatch/start", async (request, reply) => {
+    let adminUser: any;
+    try {
+      adminUser = await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ success: false, error: "FORBIDDEN" });
+    }
+
+    const body = z
+      .object({
+        mode: z.enum(["ranked", "wingman", "casual"]).default("ranked"),
+        map: z.string().optional()
+      })
+      .parse(request.body ?? {});
+    const selectedMap = body.map && MAP_POOL.includes(body.map) ? body.map : MAP_POOL[Math.floor(Math.random() * MAP_POOL.length)];
+    const mode = body.mode as QueueMode;
+    const cfg = modeConfig[mode];
+
+    const bots: Array<{ player_id: string; steam_id: string; display_name: string }> = [];
+    for (let idx = 1; idx <= cfg.playersPerMatch; idx += 1) {
+      const steamId = `testbot_${mode}_${idx}`;
+      const displayName = `TestBot ${idx}`;
+      const upsert = await db.query(
+        `INSERT INTO players (steam_id, display_name, role)
+         VALUES ($1, $2, 'player')
+         ON CONFLICT (steam_id) DO UPDATE SET display_name = EXCLUDED.display_name
+         RETURNING id, steam_id, display_name`,
+        [steamId, displayName]
+      );
+      bots.push({
+        player_id: String(upsert.rows[0].id),
+        steam_id: String(upsert.rows[0].steam_id),
+        display_name: String(upsert.rows[0].display_name)
+      });
+      await db.query(
+        `INSERT INTO player_stats (player_id, wins, losses, matches_played)
+         VALUES ($1, 0, 0, 0)
+         ON CONFLICT (player_id) DO NOTHING`,
+        [upsert.rows[0].id]
+      );
+    }
+
+    const startRes = await fetch(`${process.env.SERVER_MANAGER_BASE_URL ?? "http://server-manager:3003"}/servers/start`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(serverManagerApiToken ? { "x-server-manager-token": serverManagerApiToken } : {}),
+        ...(internalApiToken ? { "x-internal-token": internalApiToken } : {})
+      },
+      body: JSON.stringify({
+        mode,
+        map: selectedMap
+      })
+    });
+    if (!startRes.ok) {
+      const errText = await startRes.text();
+      return reply.code(502).send({ success: false, error: "SERVER_START_FAILED", details: errText.slice(0, 400) });
+    }
+    const server = (await startRes.json()) as {
+      server_id: string;
+      server_ip: string;
+      port: number;
+      server_password: string;
+      spectator_password: string;
+      connect_string: string;
+      map: string;
+    };
+
+    const insertedMatch = await db.query(
+      `INSERT INTO matches (map, status, server_id, server_ip, server_port, server_password, spectator_password, connect_string, mode, unranked, started_at, created_at)
+       VALUES ($1, 'live', $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+       RETURNING *`,
+      [
+        server.map ?? selectedMap,
+        server.server_id,
+        server.server_ip,
+        server.port,
+        server.server_password,
+        server.spectator_password,
+        server.connect_string,
+        mode,
+        cfg.unranked
+      ]
+    );
+    const matchId = String(insertedMatch.rows[0].id);
+
+    const teamA = bots.slice(0, cfg.teamSize);
+    const teamB = bots.slice(cfg.teamSize, cfg.teamSize * 2);
+    for (const player of teamA) {
+      await db.query("INSERT INTO match_players (match_id, player_id, team) VALUES ($1, $2, 'A') ON CONFLICT DO NOTHING", [matchId, player.player_id]);
+    }
+    for (const player of teamB) {
+      await db.query("INSERT INTO match_players (match_id, player_id, team) VALUES ($1, $2, 'B') ON CONFLICT DO NOTHING", [matchId, player.player_id]);
+    }
+
+    await db.query(
+      `INSERT INTO admin_test_matches (match_id, server_id, started_by_player_id, mode, map, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, 'running', NOW())
+       ON CONFLICT (match_id) DO UPDATE
+       SET server_id = EXCLUDED.server_id,
+           started_by_player_id = EXCLUDED.started_by_player_id,
+           status = EXCLUDED.status`,
+      [matchId, server.server_id, String(adminUser.playerId), mode, server.map ?? selectedMap]
+    );
+    await db.query(
+      `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+       VALUES ($1, 'test_match_started', $2::jsonb, NOW())`,
+      [
+        matchId,
+        JSON.stringify({
+          mode,
+          map: server.map ?? selectedMap,
+          server_id: server.server_id,
+          server_ip: server.server_ip,
+          port: server.port
+        })
+      ]
+    );
+
+    const payload = {
+      success: true,
+      match_id: matchId,
+      mode,
+      map: server.map ?? selectedMap,
+      server: {
+        id: server.server_id,
+        ip: server.server_ip,
+        port: server.port
+      },
+      connect_command: `connect ${server.server_ip}:${server.port}; password ${server.server_password}`,
+      spectate_command: `connect ${server.server_ip}:${server.port}; password ${server.spectator_password}`
+    };
+    emitRealtime("match:update", { type: "test_match_started", ...payload });
+    emitRealtime("servers:update", { changed: true });
+    return payload;
+  });
+
+  app.post("/admin/testmatch/stop", async (request, reply) => {
+    try {
+      await assertAdminUser(request);
+    } catch {
+      return reply.code(403).send({ success: false, error: "FORBIDDEN" });
+    }
+
+    const body = z
+      .object({
+        match_id: z.string().uuid().optional(),
+        server_id: z.string().optional()
+      })
+      .parse(request.body ?? {});
+
+    const testMatch = await db.query(
+      `SELECT atm.match_id, atm.server_id
+       FROM admin_test_matches atm
+       WHERE ($1::uuid IS NULL OR atm.match_id = $1)
+         AND ($2::text IS NULL OR atm.server_id = $2)
+         AND atm.status = 'running'
+       ORDER BY atm.created_at DESC
+       LIMIT 1`,
+      [body.match_id ?? null, body.server_id ?? null]
+    );
+    if (!testMatch.rowCount) {
+      return reply.code(404).send({ success: false, error: "TEST_MATCH_NOT_FOUND" });
+    }
+    const matchId = String(testMatch.rows[0].match_id);
+    const serverId = String(testMatch.rows[0].server_id);
+
+    await fetch(`${process.env.SERVER_MANAGER_BASE_URL ?? "http://server-manager:3003"}/servers/stop/${encodeURIComponent(serverId)}`, {
+      method: "POST",
+      headers: {
+        ...(serverManagerApiToken ? { "x-server-manager-token": serverManagerApiToken } : {}),
+        ...(internalApiToken ? { "x-internal-token": internalApiToken } : {})
+      }
+    }).catch(() => null);
+
+    await db.query("UPDATE matches SET status = 'cancelled', ended_at = NOW() WHERE id = $1", [matchId]);
+    await db.query("UPDATE admin_test_matches SET status = 'stopped', stopped_at = NOW() WHERE match_id = $1", [matchId]);
+    await db.query(
+      `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+       VALUES ($1, 'test_match_stopped', $2::jsonb, NOW())`,
+      [matchId, JSON.stringify({ server_id: serverId })]
+    );
+
+    emitRealtime("match:update", { type: "test_match_stopped", match_id: matchId });
+    emitRealtime("servers:update", { changed: true });
+    return { success: true, match_id: matchId, server_id: serverId };
+  });
+
   app.post("/internal/matches/:id/live", async (request) => {
   const params = z.object({ id: z.string().uuid() }).parse(request.params);
   await db.query(
@@ -7681,6 +10314,29 @@ async function buildServer() {
      WHERE id = $1`,
     [params.id]
   );
+  await db.query(
+    `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+     VALUES ($1, 'match_live', $2::jsonb, NOW())`,
+    [params.id, JSON.stringify({ status: "live" })]
+  );
+  emitRealtime("match:update", { type: "match_live", match_id: params.id });
+  emitRealtime("match:timeline", { match_id: params.id, event_type: "match_live" });
+  const matchInfo = await db.query("SELECT mode, map, server_ip, server_port FROM matches WHERE id = $1 LIMIT 1", [params.id]);
+  if (matchInfo.rowCount) {
+    await createNotificationsForMatchPlayers({
+      matchId: params.id,
+      kind: "match_starting",
+      title: "Match starting",
+      message: `Server is live on ${String(matchInfo.rows[0].map ?? "unknown map")}.`,
+      metadata: {
+        match_id: params.id,
+        mode: String(matchInfo.rows[0].mode ?? "ranked"),
+        map: String(matchInfo.rows[0].map ?? "unknown"),
+        server_ip: String(matchInfo.rows[0].server_ip ?? ""),
+        server_port: Number(matchInfo.rows[0].server_port ?? 0)
+      }
+    });
+  }
   return { ok: true };
   });
 
@@ -7764,6 +10420,29 @@ async function buildServer() {
   if (!updated.rowCount) {
     return reply.code(404).send({ error: "Match not found" });
   }
+  await db.query(
+    `INSERT INTO match_timeline_events (match_id, event_type, payload, created_at)
+     VALUES ($1, 'state_update', $2::jsonb, NOW())`,
+    [
+      params.id,
+      JSON.stringify({
+        team_a_score: body.team_a_score ?? null,
+        team_b_score: body.team_b_score ?? null,
+        round_number: body.round_number ?? null
+      })
+    ]
+  );
+  emitRealtime("match:update", {
+    type: "state_update",
+    match_id: params.id,
+    team_a_score: body.team_a_score ?? null,
+    team_b_score: body.team_b_score ?? null,
+    round_number: body.round_number ?? null
+  });
+  emitRealtime("match:timeline", {
+    match_id: params.id,
+    event_type: "state_update"
+  });
   return { ok: true, match_id: params.id };
   });
 
@@ -8370,6 +11049,7 @@ async function buildServer() {
   }
 
   const exists = await db.query("SELECT id FROM matches WHERE id = $1", [body.match_id]);
+  const isNewMatch = !exists.rowCount;
   if (!exists.rowCount) {
     await db.query(
       `INSERT INTO matches (id, map, team_a, team_b, status, mode, unranked)
@@ -8425,6 +11105,16 @@ async function buildServer() {
        WHERE id = $1`,
       [body.match_id, creatorInMatch.rows[0].id]
     );
+  }
+
+  if (isNewMatch) {
+    await createNotificationsForMatchPlayers({
+      matchId: body.match_id,
+      kind: "match_found",
+      title: "Match found",
+      message: `Your ${mode} match is ready. Open your lobby and get ready.`,
+      metadata: { match_id: body.match_id, mode }
+    });
   }
 
   return { ok: true, match_id: body.match_id };
@@ -8578,6 +11268,19 @@ async function buildServer() {
     server_ip: match.server_ip,
     port: match.server_port
   });
+  await createNotificationsForMatchPlayers({
+    matchId: String(match.id),
+    kind: "match_starting",
+    title: "Match starting",
+    message: `Server is live on ${String(match.map ?? "unknown map")}. Join now.`,
+    metadata: {
+      match_id: String(match.id),
+      mode: String(match.mode ?? "ranked"),
+      map: String(match.map ?? "unknown"),
+      server_ip: String(match.server_ip ?? ""),
+      server_port: Number(match.server_port ?? 0)
+    }
+  });
 
   return {
     match_id: match.id,
@@ -8670,6 +11373,19 @@ async function buildServer() {
     server_id: match.server_id,
     server_ip: match.server_ip,
     port: match.server_port
+  });
+  await createNotificationsForMatchPlayers({
+    matchId: String(match.id),
+    kind: "match_starting",
+    title: "Match starting",
+    message: `Your ${mode} match is now live on ${String(match.map ?? "unknown map")}.`,
+    metadata: {
+      match_id: String(match.id),
+      mode,
+      map: String(match.map ?? "unknown"),
+      server_ip: String(match.server_ip ?? ""),
+      server_port: Number(match.server_port ?? 0)
+    }
   });
   return {
     match_id: match.id,

@@ -1,0 +1,27 @@
+{
+  "mirage": {
+    "background": "/assets/maps/mirage.svg",
+    "radar": "/assets/maps/de_mirage_radar.svg",
+    "fallback_background": "https://totalcsgo.com/images/maps/mirage.jpg"
+  },
+  "dust2": {
+    "background": "/assets/maps/dust2.svg",
+    "radar": "/assets/maps/de_dust2_radar.svg",
+    "fallback_background": "https://totalcsgo.com/images/maps/dust2.jpg"
+  },
+  "inferno": {
+    "background": "/assets/maps/inferno.svg",
+    "radar": "/assets/maps/de_inferno_radar.svg",
+    "fallback_background": "https://totalcsgo.com/images/maps/inferno.jpg"
+  },
+  "nuke": {
+    "background": "/assets/maps/nuke.svg",
+    "radar": "/assets/maps/de_nuke_radar.svg",
+    "fallback_background": "https://totalcsgo.com/images/maps/nuke.jpg"
+  },
+  "overpass": {
+    "background": "/assets/maps/overpass.svg",
+    "radar": "/assets/maps/de_overpass_radar.svg",
+    "fallback_background": "https://totalcsgo.com/images/maps/overpass.jpg"
+  }
+}
