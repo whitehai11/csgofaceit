@@ -3005,6 +3005,10 @@ async function buildServer() {
       steamId,
       linkedDiscordId
     ]);
+    await db.query("DELETE FROM steam_links WHERE steam_id = $1 AND discord_id <> $2", [
+      steamId,
+      linkedDiscordId
+    ]);
     await db.query("DELETE FROM users WHERE steam_id = $1 AND discord_id <> $2", [
       steamId,
       linkedDiscordId
