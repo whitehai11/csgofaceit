@@ -31,6 +31,26 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+load_env_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+    [[ "$line" != *"="* ]] && continue
+    local key="${line%%=*}"
+    local value="${line#*=}"
+    key="$(printf '%s' "$key" | tr -d '[:space:]')"
+    [[ -z "$key" ]] && continue
+    if [[ "$value" =~ ^\".*\"$ ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" =~ ^\'.*\'$ ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    export "${key}=${value}"
+  done < "$file"
+}
+
 compose() {
   if have_cmd docker && docker compose version >/dev/null 2>&1; then
     docker compose "$@"
@@ -168,10 +188,7 @@ main() {
     info ".env already exists; values will be updated interactively."
   fi
 
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
+  load_env_file .env
 
   local discord_token jwt_secret internal_api_token internal_webhook_secret server_manager_token cors_origins
 
